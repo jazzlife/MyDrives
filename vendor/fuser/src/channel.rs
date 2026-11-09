@@ -115,6 +115,19 @@ impl Channel {
 pub(crate) struct ChannelSender(Arc<DevFuse>);
 
 impl ChannelSender {
+    /// Wakes a reader that is blocked on the channel.
+    ///
+    /// `read` on `/dev/fuse` returns as soon as the mount is gone, so upstream
+    /// needs nothing here. FUSE-T's channel is a socket to its helper, and the
+    /// helper keeps it open after the volume is unmounted: the session thread
+    /// then blocks forever and `umount_and_join` never returns. Shutting the
+    /// socket down ends that read. A channel that is not a socket - the usual
+    /// case - fails with ENOTSOCK, which is exactly the "nothing to do" answer.
+    pub(crate) fn shutdown(&self) {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::shutdown(self.0.as_raw_fd(), libc::SHUT_RDWR) };
+    }
+
     pub(crate) fn send(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
         let rc = nix::sys::uio::writev(&self.0, bufs)?;
         // writev is atomic, so do not need to check how many bytes are written.

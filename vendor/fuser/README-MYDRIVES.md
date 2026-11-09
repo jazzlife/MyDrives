@@ -47,3 +47,7 @@ Copy a newer `fuser` over this directory and re-apply the `apple_abi` cfgs;
   32 KiB write in pieces. Upstream then logs "Short read of FUSE request
   (80 < 32848)" and the write hangs; `receive_rest` reads until the length in
   the header is satisfied.
+
+The `[[example]]` targets are gone from `Cargo.toml` as well: the examples
+themselves were not copied, and `cargo test --workspace` fails to resolve
+targets that point at files which are not there.

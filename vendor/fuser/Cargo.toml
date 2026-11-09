@@ -60,51 +60,6 @@ serializable = ["serde"]
 name = "fuser"
 path = "src/lib.rs"
 
-[[example]]
-name = "async_hello"
-path = "examples/async_hello.rs"
-required-features = ["experimental"]
-
-[[example]]
-name = "hello"
-path = "examples/hello.rs"
-
-[[example]]
-name = "ioctl"
-path = "examples/ioctl.rs"
-
-[[example]]
-name = "notify_inval_entry"
-path = "examples/notify_inval_entry.rs"
-
-[[example]]
-name = "notify_inval_inode"
-path = "examples/notify_inval_inode.rs"
-
-[[example]]
-name = "null"
-path = "examples/null.rs"
-
-[[example]]
-name = "passthrough"
-path = "examples/passthrough.rs"
-
-[[example]]
-name = "passthrough_fork"
-path = "examples/passthrough_fork.rs"
-
-[[example]]
-name = "poll"
-path = "examples/poll.rs"
-
-[[example]]
-name = "poll_client"
-path = "examples/poll_client.rs"
-
-[[example]]
-name = "simple"
-path = "examples/simple.rs"
-
 [dependencies.async-trait]
 version = "0.1"
 optional = true

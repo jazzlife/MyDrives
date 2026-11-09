@@ -21,8 +21,8 @@ use std::time::{Duration, SystemTime};
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, FopenFlags,
     Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
-    SessionACL, TimeOrNow, WriteFlags,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs,
+    ReplyWrite, Request, SessionACL, TimeOrNow, WriteFlags,
 };
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
@@ -41,6 +41,11 @@ const SESSION_THREADS: usize = 4;
 /// Marks a directory handle, keeping it out of the VFS's file handle numbers.
 /// See `opendir`.
 const DIR_HANDLE_BIT: u64 = 1 << 63;
+/// How long FUSE-T's helper gets to put the volume on the mount point. It
+/// takes a second or two on a healthy Mac; the limit is only there so a broken
+/// install fails with a message instead of hanging.
+#[cfg(all(target_os = "macos", feature = "macfuse"))]
+const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct FuseProvider;
 
@@ -189,6 +194,7 @@ impl MountProvider for FuseProvider {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             readonly: spec.readonly,
+            locks: Locks::default(),
         };
 
         let session = fuser::spawn_mount(fs, &path, &config).map_err(|e| {
@@ -196,10 +202,63 @@ impl MountProvider for FuseProvider {
         })?;
 
         tracing::info!(mountpoint = %path.display(), "FUSE session started");
+
+        // FUSE-T mounts the volume from its helper *after* the session is up,
+        // which takes a second or two. Until then the path is still the empty
+        // directory underneath, and whoever we just told "mounted" - the tray,
+        // a script, the user - is looking at the wrong thing. Worse, files
+        // written into that window disappear under the volume when it lands.
+        #[cfg(all(target_os = "macos", feature = "macfuse"))]
+        if fuse_t::is_installed() && !wait_until_mounted(&path, MOUNT_TIMEOUT) {
+            let _ = session.umount_and_join();
+            return Err(Error::Backend(format!(
+                "FUSE-T did not finish mounting {} within {} s",
+                path.display(),
+                MOUNT_TIMEOUT.as_secs()
+            )));
+        }
+
         Ok(Box::new(FuseMount {
             path,
             session: Mutex::new(Some(session)),
         }))
+    }
+}
+
+/// Is `path` the root of a mounted volume right now?
+///
+/// `statfs` answers for the volume the path lives on, so a mount point that is
+/// still a plain directory reports the volume underneath it instead of itself.
+#[cfg(all(target_os = "macos", feature = "macfuse"))]
+fn is_mount_point(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(real) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(c_path) = std::ffi::CString::new(real.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    let on = unsafe { std::ffi::CStr::from_ptr(st.f_mntonname.as_ptr()) };
+    std::path::Path::new(OsStr::from_bytes(on.to_bytes())) == real
+}
+
+/// Waits for FUSE-T's helper to finish putting the volume on `path`.
+#[cfg(all(target_os = "macos", feature = "macfuse"))]
+fn wait_until_mounted(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if is_mount_point(path) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -248,6 +307,107 @@ struct FuseFs {
     uid: u32,
     gid: u32,
     readonly: bool,
+    locks: Locks,
+}
+
+/// One byte range a program has locked, `start..=end` as POSIX counts it.
+#[derive(Clone, Copy, Debug)]
+struct LockRange {
+    owner: u64,
+    start: u64,
+    end: u64,
+    write: bool,
+    pid: u32,
+}
+
+impl LockRange {
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.start <= end && start <= self.end
+    }
+
+    fn conflicts_with(&self, owner: u64, start: u64, end: u64, write: bool) -> bool {
+        self.owner != owner && (write || self.write) && self.overlaps(start, end)
+    }
+}
+
+/// POSIX advisory locks, kept in this process.
+///
+/// A remote share speaks no lock protocol we can forward to, but every program
+/// on this machine reaches the drive through this one server - so a table here
+/// is real mutual exclusion between them, which is what sqlite and anything
+/// else that locks a file is asking for. It is the same answer the kernel
+/// gives a FUSE filesystem that does not implement locking itself; without it
+/// `sqlite3` cannot so much as create a database on the mount.
+#[derive(Default)]
+struct Locks {
+    by_inode: Mutex<std::collections::HashMap<u64, Vec<LockRange>>>,
+}
+
+impl Locks {
+    /// The lock that would block this request, if any.
+    fn conflict(&self, ino: u64, owner: u64, start: u64, end: u64, write: bool) -> Option<LockRange> {
+        let table = self.by_inode.lock();
+        table
+            .get(&ino)?
+            .iter()
+            .find(|l| l.conflicts_with(owner, start, end, write))
+            .copied()
+    }
+
+    /// Takes or releases a range. `Err(())` means another owner holds it.
+    fn set(
+        &self,
+        ino: u64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        typ: Option<bool>,
+        pid: u32,
+    ) -> std::result::Result<(), ()> {
+        if let Some(write) = typ {
+            if self.conflict(ino, owner, start, end, write).is_some() {
+                return Err(());
+            }
+        }
+        let mut table = self.by_inode.lock();
+        let ranges = table.entry(ino).or_default();
+        // The owner's own ranges give way: a new lock over them replaces them,
+        // which is how an upgrade, a downgrade and an unlock all work.
+        let mut kept: Vec<LockRange> = Vec::with_capacity(ranges.len() + 2);
+        for range in ranges.iter() {
+            if range.owner != owner || !range.overlaps(start, end) {
+                kept.push(*range);
+                continue;
+            }
+            if range.start < start {
+                kept.push(LockRange { end: start - 1, ..*range });
+            }
+            if range.end > end {
+                kept.push(LockRange { start: end + 1, ..*range });
+            }
+        }
+        if let Some(write) = typ {
+            kept.push(LockRange { owner, start, end, write, pid });
+        }
+        if kept.is_empty() {
+            table.remove(&ino);
+        } else {
+            *ranges = kept;
+        }
+        Ok(())
+    }
+
+    /// Drops everything an owner holds on a file. POSIX releases a process's
+    /// locks as soon as it closes any descriptor for the file.
+    fn release_owner(&self, ino: u64, owner: u64) {
+        let mut table = self.by_inode.lock();
+        if let Some(ranges) = table.get_mut(&ino) {
+            ranges.retain(|l| l.owner != owner);
+            if ranges.is_empty() {
+                table.remove(&ino);
+            }
+        }
+    }
 }
 
 impl FuseFs {
@@ -532,14 +692,70 @@ impl fuser::Filesystem for FuseFs {
     fn flush(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
-        _lock_owner: LockOwner,
+        lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        // A close releases that program's locks on the file, and flush is where
+        // the kernel tells us a descriptor is going away.
+        self.locks.release_owner(ino.0, lock_owner.0);
         match self.rt.block_on(self.vfs.flush(fh.0)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn getlk(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: ReplyLock,
+    ) {
+        let write = typ == libc::F_WRLCK as i32;
+        match self.locks.conflict(ino.0, lock_owner.0, start, end, write) {
+            Some(l) => reply.locked(
+                l.start,
+                l.end,
+                if l.write { libc::F_WRLCK } else { libc::F_RDLCK } as i32,
+                l.pid,
+            ),
+            None => reply.locked(start, end, libc::F_UNLCK as i32, pid),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setlk(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        _sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        // `sleep` asks us to wait for the range instead of failing. Answering
+        // EAGAIN is the honest reply we can give today: the callers that matter
+        // (sqlite, git) retry a busy lock themselves.
+        let typ = match typ as i32 {
+            t if t == libc::F_UNLCK as i32 => None,
+            t if t == libc::F_WRLCK as i32 => Some(true),
+            _ => Some(false),
+        };
+        match self.locks.set(ino.0, lock_owner.0, start, end, typ, pid) {
+            Ok(()) => reply.ok(),
+            Err(()) => reply.error(Errno::EAGAIN),
         }
     }
 
@@ -560,13 +776,16 @@ impl fuser::Filesystem for FuseFs {
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
+        lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        if let Some(owner) = lock_owner {
+            self.locks.release_owner(ino.0, owner.0);
+        }
         match self.rt.block_on(self.vfs.release(fh.0)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
@@ -669,6 +888,31 @@ mod tests {
         assert_eq!(location_name("   ").as_deref(), None);
         assert_eq!(location_name("///").as_deref(), None);
         assert_eq!(location_name(&"n".repeat(100)).unwrap().len(), 63);
+    }
+
+    #[test]
+    fn locks_keep_two_programs_off_the_same_bytes() {
+        let locks = Locks::default();
+        // sqlite locks a handful of bytes high up in the file, not the whole thing.
+        assert!(locks.set(7, 0xa, 1024, 1024, Some(true), 1).is_ok());
+        assert!(locks.conflict(7, 0xb, 1024, 1024, false).is_some());
+        assert!(locks.conflict(7, 0xb, 1025, 2048, true).is_none());
+        // The holder may take the same range again, and two readers share it.
+        assert!(locks.set(7, 0xa, 1024, 1024, Some(false), 1).is_ok());
+        assert!(locks.set(7, 0xb, 1024, 1024, Some(false), 2).is_ok());
+        // A writer has to wait for both readers.
+        assert!(locks.set(7, 0xc, 1024, 1024, Some(true), 3).is_err());
+        // Unlocking takes the middle out of a range and leaves the ends.
+        assert!(locks.set(9, 0xa, 0, 99, Some(true), 1).is_ok());
+        assert!(locks.set(9, 0xa, 40, 49, None, 1).is_ok());
+        assert!(locks.conflict(9, 0xb, 40, 49, true).is_none());
+        assert!(locks.conflict(9, 0xb, 39, 39, true).is_some());
+        assert!(locks.conflict(9, 0xb, 50, 50, true).is_some());
+        // Closing the file drops what that program held, and nothing else.
+        locks.release_owner(7, 0xa);
+        assert!(locks.conflict(7, 0xc, 1024, 1024, true).is_some());
+        locks.release_owner(7, 0xb);
+        assert!(locks.conflict(7, 0xc, 1024, 1024, true).is_none());
     }
 
     #[test]

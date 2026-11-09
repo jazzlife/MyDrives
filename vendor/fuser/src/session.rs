@@ -530,6 +530,11 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
             match self.ch.receive_retrying(buf) {
+                // The channel closed. On FUSE-T that is how a session ends:
+                // its helper closes the socket, or `umount_and_join` shuts it
+                // down. Treating it as a short read would report "Invalid
+                // request" for an ordinary unmount.
+                Ok(0) => return Ok(()),
                 Ok(size) => match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
                     Some(req) => {
@@ -572,6 +577,9 @@ impl BackgroundSession {
         if let Some(mount) = self.mount.take() {
             mount.umount()?;
         }
+        // FUSE-T's helper holds the channel open after the volume is gone, so
+        // the session thread has to be woken before it can be joined.
+        self.sender.shutdown();
         self.join()
     }
 
