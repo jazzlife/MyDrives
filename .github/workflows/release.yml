@@ -45,11 +45,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          # `macos-latest`, not a pinned `macos-14`: the pinned label resolves
+          # to an XL runner on this account, which the plan does not offer
+          # ("The configuration macos-14-arm64-us-xl is not supported").
+          - os: macos-latest
             target: aarch64-apple-darwin
           # Apple Silicon runners cross-compile the Intel slice happily; a
           # separate Intel runner would only cost minutes.
-          - os: macos-14
+          - os: macos-latest
             target: x86_64-apple-darwin
           # Windows ships as x64 only - it runs under emulation on ARM64
           # Windows, and WinFsp installs winfsp-x64.dll there too.

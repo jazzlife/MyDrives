@@ -628,6 +628,49 @@ async fn handle(
                 ),
             }
         }
+        Request::Rename { id, label } => {
+            let label = label.trim().to_string();
+            if label.is_empty() {
+                return (
+                    Response::Error {
+                        message: "이름을 비워 둘 수 없습니다".into(),
+                    },
+                    false,
+                );
+            }
+            // The manager keeps its own copy of the config for `status`, so it
+            // has to learn the new name too - otherwise the window shows the
+            // old one until the agent restarts.
+            let updated = {
+                let mut cfg = config.lock();
+                if !cfg.set_label(&id, &label) {
+                    None
+                } else {
+                    let saved = cfg.save();
+                    cfg.get(&id).cloned().map(|remote| (remote, saved))
+                }
+            };
+            match updated {
+                None => (
+                    Response::Error {
+                        message: format!("{id} 드라이브를 찾을 수 없습니다"),
+                    },
+                    false,
+                ),
+                Some((remote, saved)) => {
+                    manager.put(remote);
+                    match saved {
+                        Ok(()) => (Response::Ok, false),
+                        Err(e) => (
+                            Response::Error {
+                                message: format!("이름은 바꿨지만 저장하지 못했습니다: {e}"),
+                            },
+                            false,
+                        ),
+                    }
+                }
+            }
+        }
         Request::Mount { id } => match manager.mount(&id).await {
             Ok(mountpoint) => (Response::Mounted { id, mountpoint }, false),
             Err(e) => (

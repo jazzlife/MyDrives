@@ -298,11 +298,27 @@ where
     let sums = download(&http, sums_asset, token.as_ref()).await?;
     let sums = String::from_utf8_lossy(&sums).into_owned();
 
+    // A release that carries nothing for this platform - a build that failed
+    // for macOS, say - must fail here. Staging an empty update would "apply"
+    // nothing, leave the version unchanged, and have the agent download and
+    // restart for the same release again at every check.
+    let agent = binary_names()
+        .last()
+        .cloned()
+        .expect("binary_names is never empty");
+    if release.asset(&asset_name(&agent)).is_none() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(Error::NotFound(format!(
+            "릴리즈 {version} 에 {} 용 파일이 없습니다",
+            target_triple()
+        )));
+    }
+
     for binary in binary_names() {
         let wanted = asset_name(&binary);
         let Some(asset) = release.asset(&wanted) else {
-            // Not every build has to ship every executable; a missing one is
-            // left as it is rather than failing the whole update.
+            // Beyond the agent itself a missing file is tolerated: an older
+            // release may not have shipped every executable.
             tracing::warn!(asset = %wanted, "릴리즈에 없는 실행 파일 — 건너뜁니다");
             continue;
         };
@@ -571,5 +587,38 @@ mod apply_tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    fn release_with(assets: &[&str]) -> Release {
+        Release {
+            tag_name: "v9.9.9".into(),
+            name: String::new(),
+            prerelease: false,
+            draft: false,
+            assets: assets
+                .iter()
+                .map(|name| Asset {
+                    name: (*name).to_string(),
+                    url: format!("https://example.invalid/{name}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_release_without_this_platform_is_not_a_usable_update() {
+        // The agent's own binary is what makes an update worth applying: a
+        // release built for another OS must be reported as missing instead of
+        // being staged empty and "applied" on every check, forever.
+        let ours = asset_name(binary_names().last().unwrap());
+        assert!(release_with(&[&ours]).asset(&ours).is_some());
+        assert!(release_with(&["mydrivesd-some-other-target"])
+            .asset(&ours)
+            .is_none());
     }
 }

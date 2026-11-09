@@ -42,6 +42,8 @@ pub enum Request {
     /// Ask the server which shares it offers (the `share` field is ignored).
     ListShares { remote: RemoteConfig, secret: Option<String> },
     Remove { id: String },
+    /// Change what a drive is called (the label, not the id).
+    Rename { id: String, label: String },
     Mount { id: String },
     Unmount { id: String },
     /// Update state, or ask for a check / an immediate apply.

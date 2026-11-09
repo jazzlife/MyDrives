@@ -127,6 +127,9 @@ struct App {
     selected: Option<String>,
     /// "저장하고 연결"에서 저장이 끝난 뒤 이어서 연결할 드라이브.
     pending_mount: Option<String>,
+    /// 이름 칸에 입력 중인 값과, 그게 어느 드라이브의 것인지.
+    name_edit: String,
+    name_edit_for: Option<String>,
     sized: bool,
     dark: Option<bool>,
 }
@@ -290,6 +293,8 @@ impl App {
             },
             selected: None,
             pending_mount: None,
+            name_edit: String::new(),
+            name_edit_for: None,
             sized: false,
             dark: None,
         }
@@ -635,14 +640,14 @@ impl App {
             return;
         };
 
+        // 제목은 **연결 대상**입니다. 이름은 왼쪽 목록에 이미 있으므로 여기서
+        // 되풀이하지 않고, 아래 카드에서 고칠 수 있는 칸으로 둡니다.
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&r.label).size(20.0).strong().color(p.text));
+            ui.label(RichText::new(&r.source).size(18.0).strong().color(p.text));
             ui.add_space(8.0);
             let (text, color) = state_badge(&r.state, p);
             pill(ui, &text, color);
         });
-        ui.add_space(2.0);
-        ui.label(RichText::new(&r.source).color(p.dim));
         ui.add_space(16.0);
 
         card(ui, p, |ui| {
@@ -652,6 +657,30 @@ impl App {
                 }
                 _ => None,
             };
+            // 이름은 언제든 고칠 수 있어야 합니다 — NAS가 자기 이름을 알려
+            // 주지 않으면 주소에서 따온 이름이 들어가기 때문입니다.
+            widget_row(ui, p, "이름", |ui| {
+                if self.name_edit_for.as_deref() != Some(r.id.as_str()) {
+                    self.name_edit_for = Some(r.id.clone());
+                    self.name_edit = r.label.clone();
+                }
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.name_edit)
+                        .desired_width(240.0)
+                        .hint_text("드라이브 이름"),
+                );
+                // 다른 곳을 누르거나 Enter를 치면 저장합니다.
+                let typed = self.name_edit.trim().to_string();
+                if response.lost_focus() && !typed.is_empty() && typed != r.label {
+                    self.start_action(
+                        "이름 변경",
+                        Request::Rename {
+                            id: r.id.clone(),
+                            label: typed,
+                        },
+                    );
+                }
+            });
             info_row(ui, p, "드라이브 이름", &r.id);
             info_row(ui, p, "상태", &state_detail(&r.state));
             info_row(
@@ -1073,6 +1102,18 @@ fn card(ui: &mut egui::Ui, p: &Palette, add: impl FnOnce(&mut egui::Ui)) {
             ui.set_width(ui.available_width() - 2.0);
             add(ui);
         });
+}
+
+/// 라벨 + 임의의 위젯 한 줄. [`info_row`]와 같은 자리에 맞춰 그립니다.
+fn widget_row(ui: &mut egui::Ui, p: &Palette, key: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            Vec2::new(92.0, 18.0),
+            egui::Label::new(RichText::new(key).color(p.dim)).halign(egui::Align::LEFT),
+        );
+        add(ui);
+    });
+    ui.add_space(4.0);
 }
 
 fn info_row(ui: &mut egui::Ui, p: &Palette, key: &str, value: &str) {

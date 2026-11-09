@@ -261,6 +261,18 @@ impl AppConfig {
         }
     }
 
+    /// Renames a drive. Only the label changes - the id is the mount point and
+    /// the keychain account, so renaming must not touch it.
+    pub fn set_label(&mut self, id: &str, label: &str) -> bool {
+        match self.remotes.iter_mut().find(|r| r.id == id) {
+            Some(remote) => {
+                remote.label = label.trim().to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn remove(&mut self, id: &str) -> bool {
         let before = self.remotes.len();
         self.remotes.retain(|r| r.id != id);

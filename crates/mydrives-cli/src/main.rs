@@ -53,6 +53,11 @@ enum Command {
     },
     /// Remove a remote (must be unmounted).
     Rm { id: String },
+    /// Change the name shown for a drive (the mount path keeps the share name).
+    Rename {
+        id: String,
+        name: String,
+    },
     Mount { id: String },
     Unmount { id: String },
     /// Updates: show what the agent knows, ask it to look now, or apply.
@@ -269,6 +274,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             send(&Request::Remove { id: id.clone() }, cli.json).await?;
             if !cli.json {
                 println!("removed {id}");
+            }
+        }
+        Command::Rename { id, name } => {
+            send(
+                &Request::Rename {
+                    id: id.clone(),
+                    label: name.clone(),
+                },
+                cli.json,
+            )
+            .await?;
+            if !cli.json {
+                println!("{id} 이름을 \"{name}\" 으로 바꿨습니다");
             }
         }
         Command::Mount { id } => {
