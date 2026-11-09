@@ -7,7 +7,8 @@
 //! 리스트), 오른쪽은 선택한 드라이브의 상세. 추가도 같은 자리에서 하므로 "추가"와
 //! "관리"가 따로 있지 않습니다.
 
-// 창만 띄우고 콘솔은 띄우지 않습니다(Windows).
+// 릴리즈 빌드는 콘솔 서브시스템 자체를 쓰지 않습니다. 디버그 빌드는 콘솔
+// 앱이라 Windows가 창을 하나 더 띄우는데, 그건 `main`에서 내려놓습니다.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod theme;
@@ -29,11 +30,20 @@ const SIDEBAR_WIDTH: f32 = 236.0;
 const ROW_HEIGHT: f32 = 48.0;
 
 fn main() -> eframe::Result {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // 트레이에서 띄우면(또는 디버그 빌드면) Windows가 이 프로세스에 콘솔 창을
+    // 하나 붙여 줍니다. 창 옆에 검은 콘솔이 같이 뜨는 게 그것이라, 우리가
+    // 그 콘솔의 유일한 주인일 때만 내려놓고 로그는 파일로 돌립니다.
+    let detached_log = mydrives_core::console::detach_if_sole_owner("ui.log");
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+    match detached_log {
+        Some(file) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

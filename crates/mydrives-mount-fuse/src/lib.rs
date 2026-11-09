@@ -27,6 +27,8 @@ use fuser::{
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
 
+#[cfg(target_os = "macos")]
+use mydrives_core::fuse_t;
 use mydrives_core::error::{Error, Result};
 use mydrives_core::mount::{MountProvider, MountSession, MountSpec, MountTarget};
 use mydrives_core::types::{Attr, FileKind, Ino, OpenOpts, SetAttr};
@@ -57,24 +59,41 @@ impl MountProvider for FuseProvider {
     }
 
     fn probe(&self) -> Result<()> {
-        if !PathBuf::from("/dev/fuse").exists() {
-            #[cfg(target_os = "macos")]
-            return Err(Error::Unsupported(
-                "macFUSE is not installed (no /dev/fuse); install macFUSE or use the 'nfs' provider, which needs no kernel extension".into(),
-            ));
-            #[cfg(not(target_os = "macos"))]
-            return Err(Error::Unsupported(
-                "/dev/fuse is missing; load the fuse module or run in a container with --device /dev/fuse".into(),
-            ));
+        // macOS has two FUSE implementations and they are checked differently:
+        // macFUSE is a kernel extension and shows up as `/dev/fuse`, while
+        // FUSE-T runs entirely in user space - there is no device node, only
+        // the library we are linked against.
+        #[cfg(target_os = "macos")]
+        {
+            if fuse_t::is_installed() {
+                return Ok(());
+            }
+            if !PathBuf::from("/dev/fuse").exists() {
+                return Err(Error::Unsupported(format!(
+                    "FUSE-T is not installed ({}); it is what puts a drive in Finder's sidebar. \
+                     Until then the 'nfs' provider is used, which needs nothing installed",
+                    fuse_t::LIBRARY
+                )));
+            }
+            return Ok(());
         }
-        // Unprivileged mounts go through the setuid helper; root can mount directly.
-        let euid = unsafe { libc::geteuid() };
-        if euid != 0 && which("fusermount3").is_none() && which("fusermount").is_none() {
-            return Err(Error::Unsupported(
-                "neither fusermount3 nor fusermount is on PATH, and we are not root".into(),
-            ));
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            if !PathBuf::from("/dev/fuse").exists() {
+                return Err(Error::Unsupported(
+                    "/dev/fuse is missing; load the fuse module or run in a container with --device /dev/fuse".into(),
+                ));
+            }
+            // Unprivileged mounts go through the setuid helper; root can mount directly.
+            let euid = unsafe { libc::geteuid() };
+            if euid != 0 && which("fusermount3").is_none() && which("fusermount").is_none() {
+                return Err(Error::Unsupported(
+                    "neither fusermount3 nor fusermount is on PATH, and we are not root".into(),
+                ));
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     fn supports(&self, target: &MountTarget) -> bool {
@@ -111,20 +130,21 @@ impl MountProvider for FuseProvider {
             MountOption::RW
         });
 
-        // macFUSE only: the two options that decide how Finder treats the
-        // volume.
-        //
-        // `local` sets `MNT_LOCAL`, which is what puts the volume in Finder's
-        // sidebar under 위치 with an eject button - the same place an external
-        // disk appears. Without it the volume is a network share that Finder
-        // mounts but does not list. `volname` is the name printed next to it;
-        // otherwise Finder shows the mount directory's name.
-        //
-        // The in-box NFS provider cannot do either: a userspace NFS server
-        // cannot claim to be a local disk, which is the whole reason this
-        // switch exists.
+        // The two macOS FUSE implementations want different things, and they
+        // are told apart by which one is installed.
         #[cfg(all(target_os = "macos", feature = "macfuse"))]
-        {
+        if fuse_t::is_installed() {
+            // FUSE-T mounts `fuse-t:/<volname>` over NFS by building the
+            // `mount` command as one string and splitting it on spaces, so a
+            // name like "거북이 NAS" tears the command in half and the mount
+            // hangs. Measured: `mount_nfs ... fuse-t:/dev mount /Volumes/x`.
+            // Leaving the name out makes Finder use the mount point's name,
+            // which is the share name - exactly what the path already says.
+            let _ = &spec.volume_name;
+        } else {
+            // macFUSE: `local` sets MNT_LOCAL, which is what puts a volume in
+            // Finder's sidebar next to the external disks, and `volname` is
+            // the name printed there.
             options.push(MountOption::CUSTOM("local".into()));
             if !spec.volume_name.trim().is_empty() {
                 options.push(MountOption::CUSTOM(format!(
@@ -139,7 +159,17 @@ impl MountProvider for FuseProvider {
         let mut config = Config::default();
         config.mount_options = options;
         config.acl = SessionACL::Owner;
-        config.n_threads = Some(SESSION_THREADS);
+        // Extra reader threads need the FUSE device to be cloneable
+        // (`FUSE_DEV_IOC_CLONE`). FUSE-T is not a device at all - the session
+        // is a socket to its helper - so the clones read from a file
+        // descriptor that is not theirs and requests go unanswered: the mount
+        // hangs on the first STATFS. One reader is correct there; the work
+        // still happens on the tokio runtime behind it.
+        #[cfg(target_os = "macos")]
+        let threads = if fuse_t::is_installed() { 1 } else { SESSION_THREADS };
+        #[cfg(not(target_os = "macos"))]
+        let threads = SESSION_THREADS;
+        config.n_threads = Some(threads);
 
         let fs = FuseFs {
             vfs,

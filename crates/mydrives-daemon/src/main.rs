@@ -97,7 +97,7 @@ fn main() -> anyhow::Result<()> {
     // when closed. Detached only when we are the console's sole owner (so
     // running `mydrivesd providers` in a terminal still prints normally), and
     // the log then goes to a file, since stdout no longer goes anywhere.
-    let detached_log = detach_console_if_sole_owner();
+    let detached_log = mydrives_core::console::detach_if_sole_owner("agent.log");
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| cli.log.clone().into());
     match detached_log {
@@ -217,58 +217,6 @@ fn rename_generated_labels(config: &Arc<Mutex<AppConfig>>) {
             tracing::warn!(error = %e, "바뀐 이름을 저장하지 못했습니다");
         }
     }
-}
-
-/// Gives up the console when this process is the only one attached to it, and
-/// returns the log file to use instead.
-///
-/// `GetConsoleProcessList` returning 1 means nobody else is sharing this
-/// console - i.e. it was created for us by Explorer or the `Run` key, not
-/// inherited from a shell the user is typing in.
-#[cfg(windows)]
-fn detach_console_if_sole_owner() -> Option<std::fs::File> {
-    // kernel32 is already linked by std, so this needs no new dependency.
-    extern "system" {
-        fn GetConsoleProcessList(lpdwProcessList: *mut u32, dwProcessCount: u32) -> u32;
-        fn FreeConsole() -> i32;
-    }
-    let mut pids = [0u32; 4];
-    // 0 - no console at all (started detached, which is how the updater
-    //     restarts us); 1 - a console made for us alone, by Explorer or the
-    //     `Run` key; >1 - a shell is sharing it, so the user is watching.
-    let count = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) };
-    if count > 1 {
-        return None;
-    }
-    let path = log_file_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Keep the log from growing without bound across logins.
-    if std::fs::metadata(&path).map(|m| m.len() > 4 << 20).unwrap_or(false) {
-        let _ = std::fs::remove_file(&path);
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .ok();
-    if file.is_some() && count == 1 {
-        unsafe { FreeConsole() };
-    }
-    file
-}
-
-#[cfg(not(windows))]
-fn detach_console_if_sole_owner() -> Option<std::fs::File> {
-    // launchd redirects the agent's output to the same file (see
-    // `mydrives_core::autostart`), and a terminal needs no special handling.
-    None
-}
-
-#[cfg(windows)]
-fn log_file_path() -> std::path::PathBuf {
-    mydrives_core::config::config_dir().join("agent.log")
 }
 
 /// Mount layers this build can use, in preference order.
