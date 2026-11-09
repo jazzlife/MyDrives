@@ -56,12 +56,18 @@ jobs:
             id: macos
             targets: aarch64-apple-darwin x86_64-apple-darwin
             test_target: aarch64-apple-darwin
+            # Without `macfuse` the FUSE provider is compiled out and the agent
+            # falls back to the NFS layer - a drive that works but never
+            # reaches Finder's sidebar. The library is linked weakly, so the
+            # binary still runs on a Mac that has no FUSE-T.
+            features: tray,mydrives-daemon/macfuse
           # Windows ships as x64 only - it runs under emulation on ARM64
           # Windows, and WinFsp installs winfsp-x64.dll there too.
           - os: windows-latest
             id: windows
             targets: x86_64-pc-windows-msvc
             test_target: x86_64-pc-windows-msvc
+            features: tray
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -88,11 +94,43 @@ jobs:
         shell: pwsh
         run: echo "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin" >> $env:GITHUB_ENV
 
+      # The macOS build links against FUSE-T, so the runner needs it - the same
+      # package the agent installs for itself, from the same place. It is not a
+      # kernel extension, so `installer` is all it takes.
+      - name: Install FUSE-T
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          url=$(curl -fsSL https://api.github.com/repos/macos-fuse-t/fuse-t/releases/latest \
+            | grep -o 'https://[^"]*\.pkg' | head -1)
+          echo "package: $url"
+          curl -fsSL "$url" -o /tmp/fuse-t.pkg
+          sudo installer -pkg /tmp/fuse-t.pkg -target /
+          test -f /usr/local/lib/libfuse-t.dylib
+          # fuser asks pkg-config for `fuse` (libfuse2); FUSE-T installs itself
+          # as `fuse-t`, so this is the same file under the name it looks for.
+          sudo mkdir -p /usr/local/lib/pkgconfig
+          sudo tee /usr/local/lib/pkgconfig/fuse.pc >/dev/null <<'PC'
+          prefix=/usr/local
+          libdir=${prefix}/lib
+          includedir=${prefix}/include/fuse
+          Name: fuse
+          Version: 2.9.9
+          Libs: -L${libdir} -lfuse-t
+          Cflags: -I${includedir}
+          PC
+          pkg-config --libs fuse
+
       - name: Build
         shell: bash
+        env:
+          # The Intel slice cross-compiles from Apple Silicon, and pkg-config
+          # refuses to answer across architectures unless told to. FUSE-T's
+          # dylib carries both, so the answer is the same either way.
+          PKG_CONFIG_ALLOW_CROSS: "1"
         run: |
           for target in ${{ matrix.targets }}; do
-            cargo build --release --features tray --target "$target" \
+            cargo build --release --features ${{ matrix.features }} --target "$target" \
               -p mydrives-daemon -p mydrives-cli -p mydrives-ui
           done
 
@@ -101,7 +139,7 @@ jobs:
       # native run does not.
       - name: Test
         shell: bash
-        run: cargo test --release --features tray --workspace --target ${{ matrix.test_target }}
+        run: cargo test --release --features ${{ matrix.features }} --workspace --target ${{ matrix.test_target }}
 
       - name: Package (macOS)
         if: runner.os != 'Windows'
