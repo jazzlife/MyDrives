@@ -119,7 +119,11 @@ jobs:
           Libs: -L${libdir} -lfuse-t
           Cflags: -I${includedir}
           PC
-          pkg-config --libs fuse
+          # Homebrew's pkg-config on Apple Silicon searches /opt/homebrew, not
+          # /usr/local where FUSE-T installs, so the build steps need pointing
+          # at it. GITHUB_ENV carries it to them.
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> "$GITHUB_ENV"
+          PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --libs fuse
 
       - name: Build
         shell: bash
