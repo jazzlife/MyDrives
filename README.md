@@ -87,10 +87,18 @@ mydrives unmount nas
 mydrives mount nas
 mydrives providers             # 이 빌드가 쓸 수 있는 마운트 계층
 
-# 4) 로그인 시 자동 시작 (트레이/메뉴바의 "로그인 시 자동 시작" 체크와 같은 동작)
+# 4) 이름 바꾸기 (보이는 이름만; 마운트 경로는 그대로)
+mydrives rename nas "거북이 NAS"
+
+# 5) 로그인 시 자동 시작 (트레이/메뉴바의 "로그인 시 자동 시작" 체크와 같은 동작)
 mydrives autostart             # 현재 상태와 등록 위치
 mydrives autostart off
 mydrives autostart on
+
+# 6) 업데이트
+mydrives update                # 지금 아는 상태
+mydrives update --check        # 바로 확인
+mydrives update --now          # 받아 둔 버전을 지금 적용(에이전트 재시작)
 ```
 
 설정 파일 위치는 `mydrives config-path`. 비밀번호는 설정 파일에 저장되지 않습니다.
@@ -110,6 +118,38 @@ mydrives autostart on
 mydrivesd dev-mount --kind smb --host 192.168.0.10 --share data \
   --user admin --password-env PW --mountpoint /tmp/nas
 # Ctrl-C 로 언마운트
+```
+
+## 이름과 경로
+
+드라이브에는 이름이 둘 있고, 가리키는 바가 다릅니다.
+
+| | 기본값 | 쓰이는 곳 |
+|---|---|---|
+| **이름**(label) | **제품 이름** — NAS 이름, 서비스 이름 | 목록·메뉴에 보이는 이름 |
+| **드라이브 이름**(id) | **공유 폴더 이름** | 마운트 경로(`~/MyDrives/<공유>`), 키체인 계정, 설정 키 |
+
+NAS 이름은 주소에서 가져옵니다(`turtlelab.ddns.net` → `turtlelab`). SMB는 장비의
+이름을 따로 알려 주지 않고, IP로 접속하면 가져올 이름 자체가 없습니다(그 경우 `NAS`).
+그래서 **이름은 언제든 고칠 수 있습니다** — 창의 "이름" 칸 또는 `mydrives rename`.
+경로와 id는 바뀌지 않으므로 이름을 바꿔도 마운트가 끊기지 않습니다.
+
+## 자동 업데이트
+
+태그를 밀면([`.github/workflows/release.yml`](.github/workflows/release.yml)) 각 타깃의
+실행 파일과 `SHA256SUMS`가 릴리즈에 올라가고, 에이전트가 그것을 받아 적용합니다.
+
+1. 기본 6시간마다 최신 릴리즈를 확인하고, 더 높은 버전이면 조용히 내려받아
+   **체크섬을 검증**한 뒤 대기시킵니다(이 단계까지는 보이는 변화가 없습니다).
+2. **열린 파일이 하나도 없을 때** 교체하고 에이전트를 다시 시작합니다. 작업 중이면
+   미뤘다가 다음 시작 때 적용합니다. 트레이에서 "지금 적용"을 누를 수도 있습니다.
+3. Windows는 실행 중인 `.exe`를 지울 수 없으므로 `*.old`로 밀어 두고 다음 시작 때 지웁니다.
+
+설정은 `config.toml`의 `[update]` — `enabled`, `repo`, `check_interval_mins`.
+**비공개 저장소**라면 기기마다 토큰이 한 번 필요합니다(공개 저장소는 불필요):
+
+```bash
+printf '%s' 'github_pat_...' | mydrives update --token-stdin   # OS 키체인에 저장
 ```
 
 ## 왜 서비스(데몬)가 아니라 사용자 세션 프로세스인가
