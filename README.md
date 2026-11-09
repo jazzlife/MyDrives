@@ -46,7 +46,7 @@ Rust 코어 하나에 OS별 마운트 어댑터를 붙이는 구조입니다. �
 ```bash
 cargo build --release                     # 에이전트 + CLI (헤드리스)
 cargo build --release --features tray     # 트레이/메뉴바 포함 (데스크탑 배포용)
-cargo test --workspace --features tray    # 단위·통합 테스트 (macOS 65 / Windows 59)
+cargo test --workspace --features tray    # 단위·통합 테스트 (macOS 82 / Windows 74)
 ```
 
 요구사항
@@ -54,7 +54,7 @@ cargo test --workspace --features tray    # 단위·통합 테스트 (macOS 65 /
 | OS | 마운트 계층 | 추가 설치 |
 |---|---|---|
 | macOS 13+ | 내장 NFS 클라이언트 | **없음** |
-| macOS (선택) | macFUSE | macFUSE + `--features macfuse` |
+| macOS (선택) | FUSE-T (Finder 사이드바용) | 에이전트가 자동 설치, 또는 `mydrives fuse-t --install` |
 | Windows 10/11 | WinFsp 2.x | [winfsp.dev/rel](https://winfsp.dev/rel/) + LLVM(빌드 시) |
 | Linux | FUSE | `fusermount`(fuse2/3) 또는 root |
 
@@ -133,6 +133,53 @@ NAS 이름은 주소에서 가져옵니다(`turtlelab.ddns.net` → `turtlelab`)
 이름을 따로 알려 주지 않고, IP로 접속하면 가져올 이름 자체가 없습니다(그 경우 `NAS`).
 그래서 **이름은 언제든 고칠 수 있습니다** — 창의 "이름" 칸 또는 `mydrives rename`.
 경로와 id는 바뀌지 않으므로 이름을 바꿔도 마운트가 끊기지 않습니다.
+
+## macOS 마운트 계층 (FUSE-T)
+
+기본값은 내장 NFS 클라이언트라 **아무것도 설치할 필요가 없습니다**. 다만 그렇게
+마운트한 볼륨은 Finder 사이드바에 올라가지 않습니다(macOS 26에서 측정: 사이드바
+"위치"는 DiskArbitration이 아는 디스크와 NetFS로 마운트한 서버만 올립니다).
+
+사이드바에 드라이브로 띄우려면 드라이브에 `provider = "fuse"` 를 지정하면 되고,
+**FUSE-T가 없으면 에이전트가 설치합니다** — GitHub의 최신 릴리즈를 받아
+`installer`에 넘기고, 그때 뜨는 관리자 암호 창이 동의 절차입니다. 설치를 취소하면
+기존 NFS 계층으로 계속 동작합니다.
+
+```bash
+mydrives fuse-t              # 설치 여부와 버전
+mydrives fuse-t --install    # 지금 설치
+```
+
+`[general] fuse_t_auto_install = false` 로 자동설치를 끌 수 있습니다. 설치는
+`provider = "fuse"` 를 지정한 드라이브를 마운트할 때만 시도하므로, 쓰지 않는
+사람에게 암호를 묻지 않습니다.
+
+> **현재 상태**: 설치·감지·연동(FUSE 핸드셰이크, STATFS, GETATTR)까지 동작하지만
+> FUSE-T가 자기 NFS/SMB 백엔드로 볼륨을 올리는 마지막 단계가 아직 완료되지
+> 않습니다. 그때까지 드라이브는 NFS 계층으로 마운트됩니다.
+
+### FUSE-T로 빌드하기
+
+`fuser`는 `pkg-config`로 `fuse`(libfuse2)를 찾습니다. FUSE-T는 `fuse-t.pc`라는
+다른 이름으로 설치하므로, 빌드 머신에 이름만 맞춘 파일을 하나 둡니다:
+
+```
+# /usr/local/lib/pkgconfig/fuse.pc
+prefix=/usr/local
+libdir=${prefix}/lib
+includedir=${prefix}/include/fuse
+Name: fuse
+Version: 2.9.9
+Libs: -L${libdir} -lfuse-t
+Cflags: -I${includedir}
+```
+
+```bash
+cargo build --release --features tray,macfuse
+```
+
+라이브러리는 **약한 링크(weak link)** 로 걸려 있어, FUSE-T가 없는 Mac에서도
+에이전트는 그대로 실행되고 NFS 계층을 씁니다.
 
 ## 자동 업데이트
 

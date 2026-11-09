@@ -69,6 +69,12 @@ pub struct General {
     pub probe_secs: u64,
     #[serde(default = "default_true")]
     pub show_tray: bool,
+    /// Install FUSE-T when a drive asks for the `fuse` mount layer and it is
+    /// missing. It is what puts a drive in Finder's sidebar; the install needs
+    /// an administrator password, so it only runs for a drive that asked for
+    /// it, never just because the agent started.
+    #[serde(default = "default_true")]
+    pub fuse_t_auto_install: bool,
     /// Start the agent when the user logs in. Reconciled on every start, so an
     /// agent moved or rebuilt elsewhere re-points the login item at itself
     /// instead of leaving one that launches a binary that is no longer there.
@@ -90,6 +96,7 @@ impl Default for General {
             mount_root: None,
             probe_secs: default_probe_secs(),
             show_tray: true,
+            fuse_t_auto_install: true,
             autostart: true,
         }
     }

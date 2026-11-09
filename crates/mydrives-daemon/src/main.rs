@@ -264,7 +264,11 @@ fn run_agent(
     // control socket and the tray from ever coming up, so the agent looks dead.
     if !no_automount {
         let mgr = manager.clone();
-        runtime.spawn(async move { mgr.mount_automatics().await });
+        let cfg = config.clone();
+        runtime.spawn(async move {
+            ensure_mount_layer(&cfg, None).await;
+            mgr.mount_automatics().await
+        });
     }
 
     // Register (or refresh) the login item. Done on every start rather than
@@ -619,15 +623,23 @@ async fn handle(
                 }
             }
         }
-        Request::Mount { id } => match manager.mount(&id).await {
-            Ok(mountpoint) => (Response::Mounted { id, mountpoint }, false),
-            Err(e) => (
-                Response::Error {
-                    message: e.to_string(),
-                },
-                false,
-            ),
-        },
+        Request::Mount { id } => {
+            // A drive that asked for the `fuse` layer needs FUSE-T on disk
+            // before the mount is attempted.
+            let wanted = config.lock().get(&id).cloned();
+            if let Some(remote) = &wanted {
+                ensure_mount_layer(&config, Some(remote)).await;
+            }
+            match manager.mount(&id).await {
+                Ok(mountpoint) => (Response::Mounted { id, mountpoint }, false),
+                Err(e) => (
+                    Response::Error {
+                        message: e.to_string(),
+                    },
+                    false,
+                ),
+            }
+        }
         Request::Unmount { id } => match manager.unmount(&id).await {
             Ok(()) => (Response::Ok, false),
             Err(e) => (
@@ -665,6 +677,32 @@ async fn handle(
                     false,
                 ),
             }
+        }
+        Request::FuseT { install } => {
+            let mut detail = String::new();
+            if install && !mydrives_core::fuse_t::is_installed() {
+                match mydrives_core::fuse_t::ensure_installed().await {
+                    Ok(true) => detail = "설치했습니다".into(),
+                    Ok(false) => detail = "이 플랫폼에서는 설치할 수 없습니다".into(),
+                    Err(e) => detail = format!("설치 실패: {e}"),
+                }
+            }
+            let installed = mydrives_core::fuse_t::is_installed();
+            if detail.is_empty() {
+                detail = if installed {
+                    "Finder 사이드바에 드라이브를 올릴 수 있습니다".into()
+                } else {
+                    "없어도 동작합니다 — 대신 NFS 계층을 쓰고 사이드바에는 안 뜹니다".into()
+                };
+            }
+            (
+                Response::FuseT {
+                    installed,
+                    version: mydrives_core::fuse_t::installed_version(),
+                    detail,
+                },
+                false,
+            )
         }
         Request::Autostart { enable } => {
             let result = match enable {
@@ -747,3 +785,45 @@ fn dev_mount(runtime: tokio::runtime::Runtime, cfg: RemoteConfig) -> anyhow::Res
 fn print_source(vfs: &Arc<Vfs>) {
     println!("source: {}", vfs.backend().describe());
 }
+
+/// Makes sure the mount layer a drive asked for is actually installed.
+///
+/// Only FUSE-T needs this: it is a system-wide package, and it is what gets a
+/// drive into Finder's sidebar. The install asks for an administrator
+/// password, so it runs for a drive that asked for the `fuse` provider and
+/// never just because the agent started - and at most once per run, so a
+/// cancelled prompt does not come back on every mount.
+#[cfg(target_os = "macos")]
+async fn ensure_mount_layer(config: &Arc<Mutex<AppConfig>>, remote: Option<&RemoteConfig>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static TRIED: AtomicBool = AtomicBool::new(false);
+
+    let wants_fuse = match remote {
+        Some(r) => r.provider.as_deref() == Some("fuse"),
+        None => config
+            .lock()
+            .remotes
+            .iter()
+            .any(|r| r.provider.as_deref() == Some("fuse")),
+    };
+    let auto_install = config.lock().general.fuse_t_auto_install;
+    if !mydrives_core::fuse_t::should_install(
+        auto_install,
+        wants_fuse,
+        mydrives_core::fuse_t::is_installed(),
+    ) {
+        return;
+    }
+    if TRIED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tracing::info!("FUSE-T가 없어 설치를 시작합니다 (관리자 암호를 묻습니다)");
+    match mydrives_core::fuse_t::ensure_installed().await {
+        Ok(true) => tracing::info!("FUSE-T 설치 완료"),
+        Ok(false) => tracing::warn!("FUSE-T를 설치하지 못했습니다"),
+        Err(e) => tracing::warn!(error = %e, "FUSE-T 설치 실패 — NFS 계층으로 계속합니다"),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn ensure_mount_layer(_config: &Arc<Mutex<AppConfig>>, _remote: Option<&RemoteConfig>) {}

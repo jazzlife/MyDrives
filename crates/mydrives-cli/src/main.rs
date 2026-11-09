@@ -73,6 +73,12 @@ enum Command {
         #[arg(long)]
         token_stdin: bool,
     },
+    /// macOS mount layer (FUSE-T): show it, or install it now.
+    FuseT {
+        /// Install FUSE-T if it is missing (asks for an administrator password).
+        #[arg(long)]
+        install: bool,
+    },
     /// Start MyDrives when you log in: `on`, `off`, or nothing to just show it.
     Autostart {
         #[arg(value_parser = ["on", "off"])]
@@ -365,6 +371,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     println!("최신 릴리즈: {latest}");
                 }
                 println!("{}", status.summary());
+            }
+        }
+        Command::FuseT { install } => {
+            let res = send(&Request::FuseT { install }, cli.json).await?;
+            if let Response::FuseT {
+                installed,
+                version,
+                detail,
+            } = res
+            {
+                match (installed, version) {
+                    (true, Some(v)) => println!("FUSE-T {v} 설치됨"),
+                    (true, None) => println!("FUSE-T 설치됨"),
+                    (false, _) => println!("FUSE-T 없음"),
+                }
+                println!("  {detail}");
             }
         }
         Command::Autostart { state } => {

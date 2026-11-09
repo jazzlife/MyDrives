@@ -24,13 +24,28 @@ pub const LIBRARY: &str = "/usr/local/lib/libfuse-t.dylib";
 const RELEASES: &str = "https://api.github.com/repos/macos-fuse-t/fuse-t/releases/latest";
 
 pub fn is_installed() -> bool {
-    Path::new(LIBRARY).exists()
+    Path::new(&library_path()).exists()
+}
+
+/// Overridable so a test can pretend FUSE-T is missing without uninstalling it.
+fn library_path() -> String {
+    std::env::var("MYDRIVES_FUSE_T_LIBRARY").unwrap_or_else(|_| LIBRARY.to_string())
+}
+
+/// Whether the agent should install FUSE-T before a mount.
+///
+/// Split out from the agent so the rule is visible and testable: it installs
+/// only for a drive that asked for the `fuse` layer, only when the setting
+/// allows it, and never when FUSE-T is already there - an administrator
+/// prompt that buys the user nothing is worse than no prompt at all.
+pub fn should_install(auto_install: bool, drive_wants_fuse: bool, installed: bool) -> bool {
+    auto_install && drive_wants_fuse && !installed
 }
 
 /// Version string taken from the versioned file the symlink points at
 /// (`libfuse-t-1.2.9.dylib`), or `None` when FUSE-T is not installed.
 pub fn installed_version() -> Option<String> {
-    let target = std::fs::read_link(LIBRARY).ok()?;
+    let target = std::fs::read_link(library_path()).ok()?;
     let name = target.file_name()?.to_string_lossy().into_owned();
     let version = name
         .strip_prefix("libfuse-t-")?
@@ -178,6 +193,18 @@ fn install_package(pkg: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_prompt_only_appears_when_it_would_help() {
+        // installed already - nothing to do, whatever the drive asked for
+        assert!(!should_install(true, true, true));
+        // the drive did not ask for the FUSE layer
+        assert!(!should_install(true, false, false));
+        // turned off in the config
+        assert!(!should_install(false, true, false));
+        // the one case worth an administrator prompt
+        assert!(should_install(true, true, false));
+    }
 
     #[test]
     fn version_comes_from_the_symlink_target() {

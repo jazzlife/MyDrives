@@ -50,6 +50,8 @@ pub enum Request {
     Update { action: UpdateAction },
     /// Store a GitHub token for update checks against a private repository.
     SetUpdateToken { token: String },
+    /// macOS mount layer: report FUSE-T, or install it now.
+    FuseT { install: bool },
     /// Login-item registration. `None` only reports; `Some` changes it.
     /// Handled by the agent, not the caller, because the login item has to
     /// point at the *agent* binary and only the agent knows where it lives.
@@ -68,6 +70,7 @@ pub enum Response {
     Tested { summary: String },
     Shares { shares: Vec<String> },
     Update { status: UpdateStatus },
+    FuseT { installed: bool, version: Option<String>, detail: String },
     /// `detail` is the registration itself (plist path / Run value), so the
     /// user can see what was written rather than trusting a boolean.
     Autostart { enabled: bool, detail: String },
