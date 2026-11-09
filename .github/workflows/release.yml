@@ -110,11 +110,16 @@ jobs:
           # fuser asks pkg-config for `fuse` (libfuse2); FUSE-T installs itself
           # as `fuse-t`, so this is the same file under the name it looks for.
           sudo mkdir -p /usr/local/lib/pkgconfig
+          # `Description` is not decoration: pkgconf 3 rejects a file without
+          # one, and reports it as "Package 'fuse' not found".
           sudo tee /usr/local/lib/pkgconfig/fuse.pc >/dev/null <<'PC'
           prefix=/usr/local
+          exec_prefix=${prefix}
           libdir=${prefix}/lib
           includedir=${prefix}/include/fuse
+
           Name: fuse
+          Description: FUSE-T, exposed under the libfuse2 name that fuser looks for
           Version: 2.9.9
           Libs: -L${libdir} -lfuse-t
           Cflags: -I${includedir}

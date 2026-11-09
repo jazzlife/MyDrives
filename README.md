@@ -171,9 +171,12 @@ mydrives fuse-t --install    # 지금 설치
 ```
 # /usr/local/lib/pkgconfig/fuse.pc
 prefix=/usr/local
+exec_prefix=${prefix}
 libdir=${prefix}/lib
 includedir=${prefix}/include/fuse
+
 Name: fuse
+Description: FUSE-T, exposed under the libfuse2 name that fuser looks for
 Version: 2.9.9
 Libs: -L${libdir} -lfuse-t
 Cflags: -I${includedir}
