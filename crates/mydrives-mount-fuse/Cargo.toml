@@ -28,5 +28,7 @@ libc.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.18", default-features = false }
 
+# macOS: the vendored copy, which can speak FUSE-T's (Linux) struct layout.
+# See vendor/fuser/README-MYDRIVES.md.
 [target.'cfg(target_os = "macos")'.dependencies]
-fuser = { version = "0.18", optional = true, features = ["libfuse2"] }
+fuser = { path = "../../vendor/fuser", optional = true, features = ["libfuse2"] }
