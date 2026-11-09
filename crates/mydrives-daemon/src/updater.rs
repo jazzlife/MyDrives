@@ -229,6 +229,22 @@ impl Updater {
 /// deterministic - the new process must be up before this one lets go of the
 /// control socket.
 fn restart() -> ! {
+    // Under launchd the agent is a *job*, and everything it spawns belongs to
+    // that job: the new agent was started and then killed along with us, which
+    // left the Mac with an updated binary and nothing running. launchd has to
+    // be the one to start it. `kickstart -k` does it immediately; if that is
+    // refused, exiting non-zero does it anyway, because the plist keeps the
+    // job alive on a failed exit (see `autostart`).
+    if let Some(kicked) = mydrives_core::autostart::restart_job() {
+        if !kicked {
+            tracing::warn!("launchctl kickstart 실패 — 실패 종료로 KeepAlive에 맡깁니다");
+        }
+        // `kickstart -k` kills this process to start the new one, so getting
+        // here at all means it did not take. Exit non-zero: the plist restarts
+        // the job on a failed exit, which is the same outcome one beat later.
+        std::process::exit(1);
+    }
+
     match std::env::current_exe() {
         Ok(exe) => {
             let mut command = std::process::Command::new(&exe);

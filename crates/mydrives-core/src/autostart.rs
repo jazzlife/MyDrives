@@ -151,6 +151,37 @@ pub fn disable() -> Result<()> {
     }
 }
 
+/// Asks launchd to run the agent again, for an update that has just replaced
+/// the binary underneath it.
+///
+/// `None` means this process is not a launchd job, so the caller has to start
+/// the replacement itself. `Some(false)` means launchd was asked and refused.
+/// `Some(true)` is mostly theoretical: `kickstart -k` kills this process to
+/// start the new one, so the call usually does not return at all.
+///
+/// This exists because a process spawned from inside a launchd job belongs to
+/// that job and is killed when the job exits - an update that spawned its own
+/// replacement left the Mac with a new binary and nothing running.
+#[cfg(target_os = "macos")]
+pub fn restart_job() -> Option<bool> {
+    if !std::env::var_os("XPC_SERVICE_NAME").is_some_and(|name| name != "0") {
+        return None;
+    }
+    let uid = unsafe { getuid() };
+    Some(
+        std::process::Command::new("/bin/launchctl")
+            .args(["kickstart", "-k", &format!("gui/{uid}/{LABEL}")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn restart_job() -> Option<bool> {
+    None
+}
+
 #[cfg(target_os = "macos")]
 pub fn status() -> Result<Status> {
     let path = plist_path()?;
