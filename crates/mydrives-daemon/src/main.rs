@@ -182,6 +182,43 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Replaces names the agent generated itself with the product's name.
+///
+/// Older versions labelled a drive `host/share`, which reads like a path and is
+/// the same for every share on one NAS. Names the user typed are left alone -
+/// [`naming::is_generated_label`] only recognises what we wrote.
+fn rename_generated_labels(config: &Arc<Mutex<AppConfig>>) {
+    use mydrives_core::naming;
+
+    let mut cfg = config.lock();
+    let mut taken: Vec<String> = cfg
+        .remotes
+        .iter()
+        .filter(|r| !naming::is_generated_label(&r.label, &r.backend))
+        .map(|r| r.label.clone())
+        .collect();
+    let mut changed = false;
+    for remote in &mut cfg.remotes {
+        if !naming::is_generated_label(&remote.label, &remote.backend) {
+            continue;
+        }
+        let share = match &remote.backend {
+            mydrives_core::config::BackendConfig::Smb(smb) => smb.share.clone(),
+            _ => remote.id.clone(),
+        };
+        let label = naming::unique_label(&naming::product_name(&remote.backend), &share, &taken);
+        tracing::info!(remote = %remote.id, from = %remote.label, to = %label, "이름을 제품 이름으로 바꿨습니다");
+        remote.label = label.clone();
+        taken.push(label);
+        changed = true;
+    }
+    if changed {
+        if let Err(e) = cfg.save() {
+            tracing::warn!(error = %e, "바뀐 이름을 저장하지 못했습니다");
+        }
+    }
+}
+
 /// Gives up the console when this process is the only one attached to it, and
 /// returns the log file to use instead.
 ///
@@ -266,6 +303,7 @@ fn run_agent(
     updater::apply_pending();
 
     let config = Arc::new(Mutex::new(AppConfig::load()?));
+    rename_generated_labels(&config);
     let manager = MountManager::new(
         runtime.handle().clone(),
         providers(),
@@ -429,7 +467,28 @@ async fn handle(
             },
             false,
         ),
-        Request::Add { remote, secret: s } => {
+        Request::Add { mut remote, secret: s } => {
+            // A caller that did not pick a name gets the product's: the NAS, or
+            // the service. Done here rather than in the CLI or the window
+            // because only the agent knows which names are already taken.
+            if remote.label.trim().is_empty() {
+                let taken: Vec<String> = config
+                    .lock()
+                    .remotes
+                    .iter()
+                    .filter(|r| r.id != remote.id)
+                    .map(|r| r.display_label().to_string())
+                    .collect();
+                let share = match &remote.backend {
+                    mydrives_core::config::BackendConfig::Smb(smb) => smb.share.clone(),
+                    _ => remote.id.clone(),
+                };
+                remote.label = mydrives_core::naming::unique_label(
+                    &mydrives_core::naming::product_name(&remote.backend),
+                    &share,
+                    &taken,
+                );
+            }
             let id = remote.id.clone();
             if let Some(s) = s {
                 if let Err(e) = secret::store(&id, &s) {

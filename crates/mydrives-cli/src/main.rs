@@ -399,7 +399,8 @@ fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<String>, 
             let id = id.unwrap_or_else(|| share.clone());
             Ok((
                 RemoteConfig {
-                    label: label.unwrap_or_else(|| format!("{host}/{share}")),
+                    // 비우면 에이전트가 제품 이름(NAS 이름·서비스 이름)으로 채웁니다.
+                    label: label.unwrap_or_default(),
                     automount: !no_automount,
                     readonly,
                     provider,

@@ -29,6 +29,7 @@ pub mod error;
 pub mod inode;
 pub mod manager;
 pub mod mount;
+pub mod naming;
 pub mod path;
 pub mod secret;
 pub mod types;

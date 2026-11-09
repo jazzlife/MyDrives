@@ -139,8 +139,10 @@ struct Form {
     /// 사용자가 직접 고쳤는지(그렇다면 공유 이름을 따라가지 않습니다).
     id_edited: bool,
     mountpoint_edited: bool,
+    name_edited: bool,
     home: String,
-    label: String,
+    /// 화면에 보이는 이름. 기본값은 **제품 이름**(NAS 이름·서비스 이름)입니다.
+    name: String,
     host: String,
     port: String,
     share: String,
@@ -163,8 +165,9 @@ impl Default for Form {
             id: String::new(),
             id_edited: false,
             mountpoint_edited: false,
+            name_edited: false,
             home,
-            label: String::new(),
+            name: String::new(),
             host: String::new(),
             port: "445".into(),
             share: String::new(),
@@ -181,12 +184,23 @@ impl Default for Form {
 }
 
 impl Form {
-    /// 공유 이름을 따라 드라이브 이름과 마운트 폴더를 채웁니다(사용자가 직접
-    /// 고친 칸은 건드리지 않습니다).
-    fn follow_share(&mut self) {
-        let share = self.share.trim();
+    /// 입력한 값에서 나머지를 채웁니다(사용자가 직접 고친 칸은 건드리지 않음).
+    ///
+    /// 보이는 **이름**은 제품(NAS·서비스) 이름을 따르고, **id와 마운트 폴더**는
+    /// 공유 폴더 이름을 따릅니다 — 이름은 "어느 장비인가"를, 경로는 "어느
+    /// 폴더인가"를 말해야 하기 때문입니다.
+    fn follow_sources(&mut self, taken: &[String]) {
+        let share = self.share.trim().to_string();
         if !self.id_edited {
-            self.id = share.to_string();
+            self.id = share.clone();
+        }
+        if !self.name_edited {
+            let backend = self.to_remote().backend;
+            self.name = mydrives_core::naming::unique_label(
+                &mydrives_core::naming::product_name(&backend),
+                &share,
+                taken,
+            );
         }
         if !self.mountpoint_edited && !cfg!(windows) {
             // 공유 이름을 받기 전에는 비워 둡니다. ".../MyDrives/drive" 같은
@@ -224,11 +238,8 @@ impl Form {
     fn to_remote(&self) -> RemoteConfig {
         RemoteConfig {
             id: self.id.trim().to_string(),
-            label: if self.label.trim().is_empty() {
-                format!("{}/{}", self.host.trim(), self.share.trim())
-            } else {
-                self.label.trim().to_string()
-            },
+            // 비워 두면 에이전트가 제품 이름으로 채웁니다.
+            label: self.name.trim().to_string(),
             automount: self.automount,
             readonly: self.readonly,
             provider: None,
@@ -578,10 +589,8 @@ impl App {
         painter.text(
             egui::pos2(rect.left() + 28.0, rect.center().y - 9.0),
             Align2::LEFT_CENTER,
-            // The drive name, not the label: the label is "host/share", which
-            // is both longer than the row and the same for every share on one
-            // NAS. The name is what the volume is called on this machine.
-            ellipsize(r.id.as_str(), 22),
+            // 제품 이름(= 보이는 이름). 어느 장비의 드라이브인지가 먼저입니다.
+            ellipsize(r.label.as_str(), 22),
             FontId::proportional(13.0),
             text,
         );
@@ -627,7 +636,7 @@ impl App {
         };
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&r.id).size(20.0).strong().color(p.text));
+            ui.label(RichText::new(&r.label).size(20.0).strong().color(p.text));
             ui.add_space(8.0);
             let (text, color) = state_badge(&r.state, p);
             pill(ui, &text, color);
@@ -643,6 +652,7 @@ impl App {
                 }
                 _ => None,
             };
+            info_row(ui, p, "드라이브 이름", &r.id);
             info_row(ui, p, "상태", &state_detail(&r.state));
             info_row(
                 ui,
@@ -762,27 +772,45 @@ impl App {
         ui.add_space(16.0);
 
         let mut keep = true;
-        let mut share_changed = false;
+        let mut source_changed = false;
+        // 이름이 이미 쓰이고 있는지 보려면 지금 있는 드라이브들의 이름이 필요합니다.
+        let taken: Vec<String> = self
+            .remotes
+            .iter()
+            .map(|r| r.label.clone())
+            .collect();
 
         card(ui, p, |ui| {
             egui::Grid::new("form-main")
                 .num_columns(2)
                 .spacing([14.0, 10.0])
                 .show(ui, |ui| {
+                    // 호스트가 먼저입니다: 드라이브 이름이 여기서 나옵니다.
+                    field(ui, p, "호스트", |ui| {
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut form.host)
+                                .hint_text("192.168.0.10 또는 nas.example.com")
+                                .desired_width(260.0),
+                        );
+                        source_changed |= r.changed();
+                    });
                     field(ui, p, "공유 폴더", |ui| {
                         let r = ui.add(
                             egui::TextEdit::singleline(&mut form.share)
                                 .hint_text("예: Public")
                                 .desired_width(260.0),
                         );
-                        share_changed = r.changed();
+                        source_changed |= r.changed();
                     });
-                    field(ui, p, "호스트", |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut form.host)
-                                .hint_text("192.168.0.10 또는 nas.example.com")
+                    field(ui, p, "이름", |ui| {
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut form.name)
+                                .hint_text("NAS 이름 (비워 두면 자동)")
                                 .desired_width(260.0),
                         );
+                        if r.changed() {
+                            form.name_edited = !form.name.trim().is_empty();
+                        }
                     });
                     field(ui, p, "계정", |ui| {
                         ui.add(
@@ -854,13 +882,6 @@ impl App {
                                 form.id_edited = !form.id.trim().is_empty();
                             }
                         });
-                        field(ui, p, "표시 이름", |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut form.label)
-                                    .hint_text("비워 두면 자동")
-                                    .desired_width(260.0),
-                            );
-                        });
                         field(ui, p, "포트", |ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut form.port).desired_width(90.0),
@@ -882,9 +903,9 @@ impl App {
             });
         }
 
-        // 공유 이름을 바꾸면 드라이브 이름과 마운트 폴더가 따라옵니다.
-        if share_changed || form.mountpoint.is_empty() {
-            form.follow_share();
+        // 호스트·공유 이름을 바꾸면 이름과 마운트 폴더가 따라옵니다.
+        if source_changed || form.mountpoint.is_empty() || form.name.is_empty() {
+            form.follow_sources(&taken);
         }
 
         ui.add_space(18.0);
@@ -1161,23 +1182,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn share_name_drives_the_rest() {
+    fn the_path_follows_the_share_and_the_name_follows_the_nas() {
         let mut form = Form {
             home: "/Users/x".into(),
             ..Form::default()
         };
+        form.host = "turtlelab.ddns.net".into();
         form.share = "Public".into();
-        form.follow_share();
+        form.follow_sources(&[]);
+
+        // 경로는 공유 폴더를, 이름은 장비를 따릅니다.
         assert_eq!(form.id, "Public");
+        assert_eq!(form.name, "turtlelab");
         if !cfg!(windows) {
             assert_eq!(form.mountpoint, "/Users/x/MyDrives/Public");
         }
-        // 사용자가 직접 고친 이름은 공유 이름을 따라가지 않습니다.
+
+        // 같은 NAS의 두 번째 공유는 이름이 겹치지 않게 공유 이름이 붙습니다.
+        form.follow_sources(&["turtlelab".to_string()]);
+        assert_eq!(form.name, "turtlelab (Public)");
+
+        // 사용자가 직접 고친 칸은 따라가지 않습니다.
         form.id = "nas".into();
         form.id_edited = true;
+        form.name = "거북이".into();
+        form.name_edited = true;
         form.share = "Other".into();
-        form.follow_share();
+        form.follow_sources(&[]);
         assert_eq!(form.id, "nas");
+        assert_eq!(form.name, "거북이");
     }
 
     #[test]
