@@ -317,12 +317,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             // is already stale by the time it reaches the terminal.
             if action == mydrives_ipc::UpdateAction::Check {
                 for _ in 0..40 {
-                    let checking = matches!(
+                    // `Idle` counts as "not finished": the agent answers before
+                    // its background task has even started looking, and a
+                    // completed check always lands on some other state.
+                    let waiting = matches!(
                         &res,
-                        Response::Update { status }
-                            if matches!(status.state, mydrives_core::update::UpdateState::Checking)
+                        Response::Update { status } if matches!(
+                            status.state,
+                            mydrives_core::update::UpdateState::Checking
+                                | mydrives_core::update::UpdateState::Idle
+                        )
                     );
-                    if !checking {
+                    if !waiting {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -427,7 +433,8 @@ fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<String>, 
             mount,
         } => Ok((
             RemoteConfig {
-                label: "in-memory test volume".into(),
+                // 에이전트가 제품 이름으로 채웁니다.
+                label: String::new(),
                 automount: false,
                 readonly: false,
                 provider: None,

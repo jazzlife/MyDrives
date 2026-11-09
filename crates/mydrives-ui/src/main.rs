@@ -26,7 +26,7 @@ use theme::Palette;
 
 const REFRESH: Duration = Duration::from_millis(1500);
 const SIDEBAR_WIDTH: f32 = 236.0;
-const ROW_HEIGHT: f32 = 46.0;
+const ROW_HEIGHT: f32 = 48.0;
 
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()
@@ -572,7 +572,7 @@ impl App {
         }
 
         let (text, dim) = if selected {
-            (p.on_accent, p.on_accent.linear_multiply(0.75))
+            (p.on_accent, p.on_accent.gamma_multiply(0.82))
         } else {
             (p.text, p.dim)
         };
@@ -587,7 +587,7 @@ impl App {
             },
         );
         painter.text(
-            egui::pos2(rect.left() + 28.0, rect.center().y - 9.0),
+            egui::pos2(rect.left() + 28.0, rect.center().y - 10.0),
             Align2::LEFT_CENTER,
             // 제품 이름(= 보이는 이름). 어느 장비의 드라이브인지가 먼저입니다.
             ellipsize(r.label.as_str(), 22),
@@ -595,7 +595,7 @@ impl App {
             text,
         );
         painter.text(
-            egui::pos2(rect.left() + 28.0, rect.center().y + 9.0),
+            egui::pos2(rect.left() + 28.0, rect.center().y + 8.0),
             Align2::LEFT_CENTER,
             ellipsize(&short_state(&r.state), 26),
             FontId::proportional(11.0),

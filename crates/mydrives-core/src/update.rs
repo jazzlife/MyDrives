@@ -513,3 +513,63 @@ bbbb *mydrives-ui-aarch64-apple-darwin
         assert!(names.last().unwrap().starts_with("mydrivesd"));
     }
 }
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+
+    /// The swap must leave the install directory with the new files and the old
+    /// ones moved aside - that is the step that can brick an installation, and
+    /// it is the one part that runs with no network and no GitHub involved.
+    #[test]
+    fn staged_files_replace_the_installed_ones() {
+        let root = std::env::temp_dir().join(format!("mydrives-apply-{}", std::process::id()));
+        let staged = root.join("staged");
+        let install = root.join("install");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::create_dir_all(&install).unwrap();
+
+        let names = binary_names();
+        for name in &names {
+            std::fs::write(install.join(name), b"old").unwrap();
+            std::fs::write(staged.join(name), b"new").unwrap();
+        }
+
+        apply(&staged, &install).expect("apply");
+
+        for name in &names {
+            assert_eq!(std::fs::read(install.join(name)).unwrap(), b"new");
+            // `cleanup` ran, so nothing is left lying around.
+            assert!(!install.join(format!("{name}.old")).exists(), "{name}.old");
+        }
+        // The staging directory is consumed, so it cannot be applied twice.
+        assert!(!staged.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A release that ships only some of the executables must not wipe the rest.
+    #[test]
+    fn missing_files_leave_the_installed_ones_alone() {
+        let root = std::env::temp_dir().join(format!("mydrives-partial-{}", std::process::id()));
+        let staged = root.join("staged");
+        let install = root.join("install");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::create_dir_all(&install).unwrap();
+
+        let names = binary_names();
+        for name in &names {
+            std::fs::write(install.join(name), b"old").unwrap();
+        }
+        std::fs::write(staged.join(&names[0]), b"new").unwrap();
+
+        apply(&staged, &install).expect("apply");
+
+        assert_eq!(std::fs::read(install.join(&names[0])).unwrap(), b"new");
+        for name in &names[1..] {
+            assert_eq!(std::fs::read(install.join(name)).unwrap(), b"old");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
