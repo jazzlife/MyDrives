@@ -38,6 +38,9 @@ use mydrives_core::vfs::Vfs;
 /// remote can change behind our back; the VFS cache absorbs the repeated calls.
 const TTL: Duration = Duration::from_secs(1);
 const SESSION_THREADS: usize = 4;
+/// Marks a directory handle, keeping it out of the VFS's file handle numbers.
+/// See `opendir`.
+const DIR_HANDLE_BIT: u64 = 1 << 63;
 
 pub struct FuseProvider;
 
@@ -140,7 +143,16 @@ impl MountProvider for FuseProvider {
             // hangs. Measured: `mount_nfs ... fuse-t:/dev mount /Volumes/x`.
             // Leaving the name out makes Finder use the mount point's name,
             // which is the share name - exactly what the path already says.
-            let _ = &spec.volume_name;
+            //
+            // What the sidebar prints, though, is the *server* the volume came
+            // from, and that defaults to "fuse-t" for every drive. `location`
+            // renames it, so the row reads like the drive - and drives whose
+            // name has no ASCII to work with gather under "MyDrives" instead.
+            let location =
+                location_name(&spec.volume_name).unwrap_or_else(|| "MyDrives".to_string());
+            options.push(MountOption::CUSTOM(format!("location={location}")));
+            // Keeps macOS from littering the remote with `._` sidecar files.
+            options.push(MountOption::CUSTOM("noappledouble".into()));
         } else {
             // macFUSE: `local` sets MNT_LOCAL, which is what puts a volume in
             // Finder's sidebar next to the external disks, and `volname` is
@@ -268,6 +280,41 @@ impl FuseFs {
 }
 
 /// POSIX errno for a core error, in the shape fuser wants.
+/// The name FUSE-T announces the mount under, which is what Finder prints in
+/// the sidebar.
+///
+/// The name ends up inside a Bonjour service name (`<name>._smb._tcp.local`)
+/// that macOS has to resolve before it can mount, so it is **ASCII only**:
+/// `거북이-NAS` is accepted by FUSE-T and then never resolves, and the mount
+/// dies with "Short read of FUSE request header". Whitespace becomes `-`
+/// (FUSE-T splits the mount command on spaces), everything outside
+/// `A-Za-z0-9._-` is dropped, and the result is capped at a DNS label's 63
+/// bytes. A name with nothing left - a Korean-only one - gets no name at all;
+/// the caller falls back to the application's.
+// Only the FUSE-T branch calls it; the tests cover it everywhere.
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "macfuse")),
+    allow(dead_code)
+)]
+fn location_name(volume_name: &str) -> Option<String> {
+    let mut out = String::new();
+    for ch in volume_name.trim().chars() {
+        let ch = if ch.is_whitespace() { '-' } else { ch };
+        if !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')) {
+            continue;
+        }
+        if ch == '-' && out.ends_with('-') {
+            continue;
+        }
+        if out.len() == 63 {
+            break;
+        }
+        out.push(ch);
+    }
+    let trimmed = out.trim_matches(['-', '.', '_']);
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn errno(e: &Error) -> Errno {
     match e.errno() {
         2 => Errno::ENOENT,
@@ -529,8 +576,15 @@ impl fuser::Filesystem for FuseFs {
     /// FUSE-T's SMB backend rejects a directory handle of 0 with "bad file
     /// descriptor", so one is handed out even though we do not need it:
     /// `readdir` works from the inode. The kernel never looks at the value.
+    ///
+    /// It has to stay clear of the VFS's file handles, which start at 1:
+    /// FUSE-T keeps one handle table for both, so the root directory's handle
+    /// and the first file's handle were the same number. The first copy into a
+    /// fresh mount then failed with "fcopyfile failed: Bad file descriptor"
+    /// and left a truncated file behind. The top bit is free - the VFS counts
+    /// up from 1 - so directories live above it.
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        reply.opened(FileHandle(ino.0.max(1)), FopenFlags::empty());
+        reply.opened(FileHandle(DIR_HANDLE_BIT | ino.0), FopenFlags::empty());
     }
 
     fn readdir(
@@ -602,6 +656,19 @@ mod tests {
         if let Err(e) = p.probe() {
             assert!(!e.to_string().is_empty());
         }
+    }
+
+    #[test]
+    fn location_name_survives_the_mount_command_and_bonjour() {
+        // The space is what used to tear FUSE-T's mount command in half.
+        assert_eq!(location_name("  Office  NAS  ").as_deref(), Some("Office-NAS"));
+        assert_eq!(location_name("backup/2025:주말").as_deref(), Some("backup2025"));
+        // Bonjour has to resolve the name, and a non-ASCII one never does.
+        assert_eq!(location_name("거북이 NAS").as_deref(), Some("NAS"));
+        assert_eq!(location_name("거북이").as_deref(), None);
+        assert_eq!(location_name("   ").as_deref(), None);
+        assert_eq!(location_name("///").as_deref(), None);
+        assert_eq!(location_name(&"n".repeat(100)).unwrap().len(), 63);
     }
 
     #[test]
