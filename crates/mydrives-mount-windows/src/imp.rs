@@ -154,6 +154,7 @@ impl MountProvider for WinFspProvider {
                         vfs,
                         rt,
                         readonly,
+                        volume_name,
                     };
                     // The type must be spelled out: `FileSystemHost` has both a
                     // fine- and a coarse-grained guard flavour, and `new`/`start`
@@ -191,7 +192,6 @@ impl MountProvider for WinFspProvider {
                 ))
             }
         }
-        let _ = volume_name;
 
         Ok(Box::new(WinFspMount {
             mountpoint: mount_string,
@@ -311,6 +311,9 @@ struct MyDrivesFs {
     vfs: Arc<Vfs>,
     rt: Handle,
     readonly: bool,
+    /// What Explorer prints next to the drive letter: the drive's name, not
+    /// its source URL - an external disk shows "Backup", not a device path.
+    volume_name: String,
 }
 
 /// What WinFsp hands back to us on every call for an open file.
@@ -755,7 +758,14 @@ impl FileSystemContext for MyDrivesFs {
         let st = self.rt.block_on(self.vfs.statfs()).map_err(fsp)?;
         out_volume_info.total_size = st.total_bytes;
         out_volume_info.free_size = st.free_bytes;
-        out_volume_info.set_volume_label(self.vfs.backend().describe());
+        // WinFsp keeps 32 UTF-16 units for the label; longer names are cut
+        // rather than rejected, which would fail the whole call.
+        let label: String = self.volume_name.chars().take(32).collect();
+        out_volume_info.set_volume_label(if label.is_empty() {
+            self.vfs.backend().describe()
+        } else {
+            label
+        });
         Ok(())
     }
 }

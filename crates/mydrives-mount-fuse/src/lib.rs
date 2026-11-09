@@ -111,6 +111,31 @@ impl MountProvider for FuseProvider {
             MountOption::RW
         });
 
+        // macFUSE only: the two options that decide how Finder treats the
+        // volume.
+        //
+        // `local` sets `MNT_LOCAL`, which is what puts the volume in Finder's
+        // sidebar under 위치 with an eject button - the same place an external
+        // disk appears. Without it the volume is a network share that Finder
+        // mounts but does not list. `volname` is the name printed next to it;
+        // otherwise Finder shows the mount directory's name.
+        //
+        // The in-box NFS provider cannot do either: a userspace NFS server
+        // cannot claim to be a local disk, which is the whole reason this
+        // switch exists.
+        #[cfg(all(target_os = "macos", feature = "macfuse"))]
+        {
+            options.push(MountOption::CUSTOM("local".into()));
+            if !spec.volume_name.trim().is_empty() {
+                options.push(MountOption::CUSTOM(format!(
+                    "volname={}",
+                    spec.volume_name.trim()
+                )));
+            }
+            // Keeps macOS from littering the remote with `._` sidecar files.
+            options.push(MountOption::CUSTOM("noappledouble".into()));
+        }
+
         let mut config = Config::default();
         config.mount_options = options;
         config.acl = SessionACL::Owner;
