@@ -45,19 +45,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # `macos-latest`, not a pinned `macos-14`: the pinned label resolves
-          # to an XL runner on this account, which the plan does not offer
-          # ("The configuration macos-14-arm64-us-xl is not supported").
+          # One runner per OS, not one per target: the Intel slice
+          # cross-compiles from Apple Silicon, so a second macOS runner would
+          # repeat the checkout, the toolchain and the cache for nothing.
+          #
+          # `macos-latest` rather than a pinned `macos-14`: the pinned label
+          # resolves to an XL runner this account does not have ("The
+          # configuration macos-14-arm64-us-xl is not supported").
           - os: macos-latest
-            target: aarch64-apple-darwin
-          # Apple Silicon runners cross-compile the Intel slice happily; a
-          # separate Intel runner would only cost minutes.
-          - os: macos-latest
-            target: x86_64-apple-darwin
+            id: macos
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+            test_target: aarch64-apple-darwin
           # Windows ships as x64 only - it runs under emulation on ARM64
           # Windows, and WinFsp installs winfsp-x64.dll there too.
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
+            id: windows
+            targets: x86_64-pc-windows-msvc
+            test_target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -65,12 +69,17 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+
+      - name: Install the targets this runner builds
+        shell: bash
+        run: |
+          for target in ${{ matrix.targets }}; do
+            rustup target add "$target"
+          done
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.id }}
 
       # `winfsp-sys` generates its bindings with bindgen, which needs libclang.
       # The Windows runners ship LLVM; this only points at it.
@@ -80,40 +89,50 @@ jobs:
         run: echo "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin" >> $env:GITHUB_ENV
 
       - name: Build
-        run: >
-          cargo build --release --features tray
-          --target ${{ matrix.target }}
-          -p mydrives-daemon -p mydrives-cli -p mydrives-ui
+        shell: bash
+        run: |
+          for target in ${{ matrix.targets }}; do
+            cargo build --release --features tray --target "$target" \
+              -p mydrives-daemon -p mydrives-cli -p mydrives-ui
+          done
 
+      # Only the runner's own architecture: running the Intel test binaries on
+      # an Apple Silicon runner would lean on Rosetta and prove nothing the
+      # native run does not.
       - name: Test
-        run: cargo test --release --features tray --workspace --target ${{ matrix.target }}
+        shell: bash
+        run: cargo test --release --features tray --workspace --target ${{ matrix.test_target }}
 
       - name: Package (macOS)
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          for b in mydrivesd mydrives mydrives-ui; do
-            cp "target/${{ matrix.target }}/release/$b" "dist/$b-${{ matrix.target }}"
+          for target in ${{ matrix.targets }}; do
+            for b in mydrivesd mydrives mydrives-ui; do
+              cp "target/$target/release/$b" "dist/$b-$target"
+            done
           done
           cd dist
-          shasum -a 256 mydrives* > "SHA256SUMS.${{ matrix.target }}"
+          shasum -a 256 mydrives* > "SHA256SUMS.${{ matrix.id }}"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          foreach ($b in "mydrivesd", "mydrives", "mydrives-ui") {
-            Copy-Item "target/${{ matrix.target }}/release/$b.exe" "dist/$b-${{ matrix.target }}.exe"
+          foreach ($target in "${{ matrix.targets }}".Split(" ")) {
+            foreach ($b in "mydrivesd", "mydrives", "mydrives-ui") {
+              Copy-Item "target/$target/release/$b.exe" "dist/$b-$target.exe"
+            }
           }
           Set-Location dist
           Get-ChildItem -File -Filter "mydrives*" | ForEach-Object {
             "{0}  {1}" -f (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower(), $_.Name
-          } | Set-Content -Encoding ascii "SHA256SUMS.${{ matrix.target }}"
+          } | Set-Content -Encoding ascii "SHA256SUMS.${{ matrix.id }}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.target }}
+          name: dist-${{ matrix.id }}
           path: dist/*
           if-no-files-found: error
 
