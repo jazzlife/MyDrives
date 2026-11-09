@@ -849,9 +849,9 @@ mod op {
         /// This will always be 0 except on `MacOS`.  It's recommended that
         /// implementations return EINVAL if this is not 0.
         pub(crate) fn position(&self) -> u32 {
-            #[cfg(target_os = "macos")]
+            #[cfg(apple_abi)]
             return self.arg.position;
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(apple_abi))]
             0
         }
     }

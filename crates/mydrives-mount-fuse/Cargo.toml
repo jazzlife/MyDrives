@@ -23,10 +23,11 @@ tracing.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
-# Linux: fuser with no default features keeps the pure-Rust mount path, so no
-# libfuse3 development package is needed to build.
+# Both targets point at the vendored copy: cargo wants one canonical source for
+# a dependency name. Linux keeps the pure-Rust mount path (no libfuse3 package
+# needed); macOS links libfuse2, which on this project means FUSE-T.
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.18", default-features = false }
+fuser = { path = "../../vendor/fuser", default-features = false }
 
 # macOS: the vendored copy, which can speak FUSE-T's (Linux) struct layout.
 # See vendor/fuser/README-MYDRIVES.md.

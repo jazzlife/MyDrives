@@ -38,13 +38,45 @@ impl Channel {
     /// - EINTR: Interrupted system call, retry.
     /// - EAGAIN: Explicitly instructed to try again.
     pub(crate) fn receive_retrying(&self, buffer: &mut [u8]) -> nix::Result<usize> {
-        loop {
+        let read = loop {
             match self.receive(buffer) {
-                Ok(size) => return Ok(size),
+                Ok(size) => break size,
+                Err(Errno::ENOENT | Errno::EINTR | Errno::EAGAIN) => continue,
+                Err(err) => return Err(err),
+            }
+        };
+        self.receive_rest(buffer, read)
+    }
+
+    /// Reads the rest of a request that arrived in pieces.
+    ///
+    /// `/dev/fuse` hands over exactly one request per `read`, so upstream needs
+    /// nothing here. FUSE-T's channel is a **socket**, and a stream socket may
+    /// deliver a 32 KiB write request in several chunks - upstream then reports
+    /// "Short read of FUSE request (80 < 32848)" and the write hangs forever.
+    /// The length in the request header says how much is coming, so the rest is
+    /// simply read until the message is whole.
+    fn receive_rest(&self, buffer: &mut [u8], read: usize) -> nix::Result<usize> {
+        const HEADER_LEN: usize = std::mem::size_of::<u32>();
+        if read < HEADER_LEN {
+            return Ok(read);
+        }
+        let total = u32::from_ne_bytes(buffer[..HEADER_LEN].try_into().unwrap()) as usize;
+        if total <= read || total > buffer.len() {
+            return Ok(read);
+        }
+        let mut have = read;
+        while have < total {
+            match self.receive(&mut buffer[have..total]) {
+                // The peer went away mid-request; let the caller see a short
+                // read rather than spin.
+                Ok(0) => break,
+                Ok(size) => have += size,
                 Err(Errno::ENOENT | Errno::EINTR | Errno::EAGAIN) => continue,
                 Err(err) => return Err(err),
             }
         }
+        Ok(have)
     }
 
     /// Returns a sender object for this channel. The sender object can be
