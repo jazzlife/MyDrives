@@ -33,3 +33,17 @@ upstream, unmodified.
 
 Copy a newer `fuser` over this directory and re-apply the `apple_abi` cfgs;
 `git diff` against the release tarball shows the whole patch.
+
+## Two more FUSE-T quirks, same fork
+
+* **`macfuse-4-compat`** - upstream's `build.rs` turns this on for every macOS
+  build, which widens `fuse_rename_in` to `newdir + flags + padding`. FUSE-T
+  sends the plain 8-byte form, so reading 16 bytes ate the first eight bytes of
+  the file name (`mv-src.txt` arrived as `xt`), the request failed to parse and
+  every rename came back as `ENOSYS` - `mv`, `ditto` and `rsync` all reported
+  "Permission denied". It now follows `apple-abi`.
+* **Socket framing** (`channel.rs`) - `/dev/fuse` hands over exactly one
+  request per `read`, but FUSE-T's channel is a stream socket and may deliver a
+  32 KiB write in pieces. Upstream then logs "Short read of FUSE request
+  (80 < 32848)" and the write hangs; `receive_rest` reads until the length in
+  the header is satisfied.

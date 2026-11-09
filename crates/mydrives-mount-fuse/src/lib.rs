@@ -526,6 +526,13 @@ impl fuser::Filesystem for FuseFs {
         }
     }
 
+    /// FUSE-T's SMB backend rejects a directory handle of 0 with "bad file
+    /// descriptor", so one is handed out even though we do not need it:
+    /// `readdir` works from the inode. The kernel never looks at the value.
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(ino.0.max(1)), FopenFlags::empty());
+    }
+
     fn readdir(
         &self,
         _req: &Request,

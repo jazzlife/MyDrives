@@ -32,7 +32,13 @@ fn main() {
                 .map_err(|e| eprintln!("{e}"))
                 .unwrap();
             println!("cargo::rustc-cfg=fuser_mount_impl=\"libfuse2\"");
-            println!("cargo::rustc-cfg=feature=\"macfuse-4-compat\"");
+            // macFUSE 4 widened `fuse_rename_in` to newdir + flags + padding.
+            // FUSE-T sends the plain 8-byte form, and reading 16 bytes there
+            // eats the first eight bytes of the file name, so every rename came
+            // back as ENOSYS. Part of the Apple dialect, like `fuse_attr`.
+            if std::env::var_os("CARGO_FEATURE_APPLE_ABI").is_some() {
+                println!("cargo::rustc-cfg=feature=\"macfuse-4-compat\"");
+            }
         }
     } else if cfg!(feature = "libfuse3") {
         configure_libfuse3().unwrap();
