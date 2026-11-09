@@ -1,0 +1,32 @@
+[package]
+name = "mydrives-mount-fuse"
+description = "FUSE mount provider (Linux, and macOS with macFUSE) for MyDrives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Build the provider on macOS too. Requires macFUSE and its pkg-config file at
+# build time (`fuse.pc`), because fuser's pure-Rust mount path is Linux-only and
+# on macOS it links libfuse from macFUSE. Without this feature the crate is empty
+# on macOS and the NFS provider - which needs no kernel extension - is used.
+macfuse = ["dep:fuser"]
+
+[dependencies]
+mydrives-core.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Linux: fuser with no default features keeps the pure-Rust mount path, so no
+# libfuse3 development package is needed to build.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.18", optional = true, features = ["libfuse2"] }

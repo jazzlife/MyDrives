@@ -1,0 +1,19 @@
+[package]
+name = "mydrives-cli"
+description = "Command line control for the MyDrives agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mydrives"
+path = "src/main.rs"
+
+[dependencies]
+mydrives-core.workspace = true
+mydrives-ipc.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }

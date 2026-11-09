@@ -1,0 +1,26 @@
+[package]
+name = "mydrives-ui"
+description = "MyDrives settings window (add and manage drives)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mydrives-ui"
+path = "src/main.rs"
+
+[dependencies]
+mydrives-core.workspace = true
+mydrives-ipc.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+eframe = { version = "0.37", default-features = false, features = [
+  "default_fonts",
+  "glow",
+  "wayland",
+  "x11",
+] }
+egui = "0.37"

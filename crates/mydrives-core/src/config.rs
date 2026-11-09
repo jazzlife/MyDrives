@@ -1,0 +1,316 @@
+//! On-disk configuration (TOML) for the agent.
+//!
+//! Secrets never live here - only a reference to the OS keychain entry. See
+//! [`crate::secret`].
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub general: General,
+    #[serde(default)]
+    pub update: UpdateConfig,
+    #[serde(default, rename = "remote")]
+    pub remotes: Vec<RemoteConfig>,
+}
+
+/// Where new versions come from. See [`crate::update`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// `owner/repo` on GitHub. Releases are matched by tag (`v0.2.0`).
+    #[serde(default = "default_update_repo")]
+    pub repo: String,
+    #[serde(default = "default_check_interval")]
+    pub check_interval_mins: u64,
+    /// Accept pre-releases as well. Off: a tagged beta must not land on a
+    /// machine that only asked for releases.
+    #[serde(default)]
+    pub prerelease: bool,
+    /// Read a GitHub token from the OS keychain. Needed only for a private
+    /// repository; a public one is read anonymously.
+    #[serde(default = "default_true")]
+    pub use_token: bool,
+}
+
+fn default_update_repo() -> String {
+    "jazzlife/MyDrives".to_string()
+}
+
+fn default_check_interval() -> u64 {
+    360
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        UpdateConfig {
+            enabled: true,
+            repo: default_update_repo(),
+            check_interval_mins: default_check_interval(),
+            prerelease: false,
+            use_token: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct General {
+    /// Where to put mount points that are not drive letters.
+    #[serde(default)]
+    pub mount_root: Option<String>,
+    /// Seconds between liveness probes of a mounted remote.
+    #[serde(default = "default_probe_secs")]
+    pub probe_secs: u64,
+    #[serde(default = "default_true")]
+    pub show_tray: bool,
+    /// Start the agent when the user logs in. Reconciled on every start, so an
+    /// agent moved or rebuilt elsewhere re-points the login item at itself
+    /// instead of leaving one that launches a binary that is no longer there.
+    #[serde(default = "default_true")]
+    pub autostart: bool,
+}
+
+fn default_probe_secs() -> u64 {
+    20
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for General {
+    fn default() -> Self {
+        General {
+            mount_root: None,
+            probe_secs: default_probe_secs(),
+            show_tray: true,
+            autostart: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Stable identifier; also the keychain account name.
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default = "default_true")]
+    pub automount: bool,
+    #[serde(default)]
+    pub readonly: bool,
+    /// Mount layer to use: `fuse`, `nfs`, `winfsp`, or unset for "best available".
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Windows drive letter, e.g. "Z:".
+    #[serde(default)]
+    pub drive: Option<String>,
+    /// Mount directory for POSIX hosts, e.g. "/Volumes/nas" or "~/MyDrives/nas".
+    #[serde(default)]
+    pub mountpoint: Option<String>,
+    pub backend: BackendConfig,
+}
+
+impl RemoteConfig {
+    pub fn display_label(&self) -> &str {
+        if self.label.is_empty() {
+            &self.id
+        } else {
+            &self.label
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum BackendConfig {
+    Smb(SmbConfig),
+    Mem(MemConfig),
+    // Planned, deliberately not stubbed as half-working backends:
+    //   Webdav(WebdavConfig), Ftp(FtpConfig), Gdrive(OAuthConfig),
+    //   Onedrive(OAuthConfig), Dropbox(OAuthConfig)
+    // Tracked for the second phase; see README.
+}
+
+impl BackendConfig {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            BackendConfig::Smb(_) => "smb",
+            BackendConfig::Mem(_) => "mem",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmbConfig {
+    pub host: String,
+    #[serde(default = "default_smb_port")]
+    pub port: u16,
+    pub share: String,
+    #[serde(default)]
+    pub user: String,
+    /// Subdirectory of the share to expose as the mount root.
+    #[serde(default)]
+    pub subpath: Option<String>,
+    /// Where the password comes from. Default: the OS keychain.
+    #[serde(default)]
+    pub secret: SecretRef,
+}
+
+fn default_smb_port() -> u16 {
+    445
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemConfig {
+    /// Seed the in-memory tree with the standard fixture (used by smoke tests).
+    #[serde(default)]
+    pub fixture: bool,
+}
+
+/// How to obtain a secret. `Keychain` is the default and the only one that should
+/// be used in production; the others exist for CI and for headless servers with no
+/// keychain daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "lowercase")]
+pub enum SecretRef {
+    Keychain,
+    Env { name: String },
+    /// Plain file, 0600. Logged as a warning on every mount.
+    File { path: String },
+    /// Inline, for throwaway test configs only.
+    Inline { value: String },
+}
+
+impl Default for SecretRef {
+    fn default() -> Self {
+        SecretRef::Keychain
+    }
+}
+
+/// Config directory, overridable with `MYDRIVES_CONFIG_DIR` (tests, portable use).
+pub fn config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("MYDRIVES_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(dirs) = directories::ProjectDirs::from("app", "MyDrives", "MyDrives") {
+        return dirs.config_dir().to_path_buf();
+    }
+    PathBuf::from(".")
+}
+
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+/// Default parent directory for POSIX mount points.
+pub fn default_mount_root() -> PathBuf {
+    if let Ok(dir) = std::env::var("MYDRIVES_MOUNT_ROOT") {
+        return PathBuf::from(dir);
+    }
+    match directories::UserDirs::new() {
+        Some(u) => u.home_dir().join("MyDrives"),
+        None => PathBuf::from("/tmp/MyDrives"),
+    }
+}
+
+impl AppConfig {
+    pub fn load() -> Result<Self> {
+        Self::load_from(&config_path())
+    }
+
+    pub fn load_from(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str(&text)
+                .map_err(|e| Error::InvalidArgument(format!("{}: {e}", path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AppConfig::default()),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        self.save_to(&config_path())
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(self)
+            .map_err(|e| Error::Backend(format!("serialize config: {e}")))?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn get(&self, id: &str) -> Option<&RemoteConfig> {
+        self.remotes.iter().find(|r| r.id == id)
+    }
+
+    pub fn upsert(&mut self, remote: RemoteConfig) {
+        match self.remotes.iter_mut().find(|r| r.id == remote.id) {
+            Some(slot) => *slot = remote,
+            None => self.remotes.push(remote),
+        }
+    }
+
+    pub fn remove(&mut self, id: &str) -> bool {
+        let before = self.remotes.len();
+        self.remotes.retain(|r| r.id != id);
+        self.remotes.len() != before
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_toml() {
+        let mut cfg = AppConfig::default();
+        cfg.upsert(RemoteConfig {
+            id: "nas".into(),
+            label: "home NAS".into(),
+            automount: true,
+            readonly: false,
+            provider: None,
+            drive: Some("Z:".into()),
+            mountpoint: None,
+            backend: BackendConfig::Smb(SmbConfig {
+                host: "192.168.0.10".into(),
+                port: 445,
+                share: "data".into(),
+                user: "admin".into(),
+                subpath: None,
+                secret: SecretRef::Keychain,
+            }),
+        });
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.remotes.len(), 1);
+        let r = &back.remotes[0];
+        assert_eq!(r.id, "nas");
+        assert_eq!(r.backend.kind(), "smb");
+        match &r.backend {
+            BackendConfig::Smb(s) => {
+                assert_eq!(s.share, "data");
+                assert!(matches!(s.secret, SecretRef::Keychain));
+            }
+            _ => panic!("wrong kind"),
+        }
+    }
+
+    #[test]
+    fn missing_file_is_empty_config() {
+        let cfg = AppConfig::load_from(Path::new("/nonexistent/mydrives.toml")).unwrap();
+        assert!(cfg.remotes.is_empty());
+        assert_eq!(cfg.general.probe_secs, 20);
+    }
+}

@@ -1,0 +1,34 @@
+[package]
+name = "mydrives-mount-windows"
+description = "Windows mount provider (WinFsp) for MyDrives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mydrives-core.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# Windows-only: the crate builds to an empty library elsewhere so the workspace
+# stays buildable on Linux and macOS.
+#
+# WinFsp was chosen over Dokany for the first implementation because its Rust
+# bindings are maintained (0.13.2+winfsp-2.1, Oct 2026) and it integrates with
+# the Windows cache manager, which Dokan does not. Note the licence: WinFsp is
+# GPLv3, with a paid commercial licence for closed-source distribution. This
+# project is internal-use only, so the GPLv3 terms are fine; if that ever
+# changes, implement a `dokan` provider behind the same MountProvider trait
+# rather than touching the VFS.
+[target.'cfg(windows)'.dependencies]
+winfsp = "0.13"
+winfsp-sys = "0.12"
+# Used to load the WinFsp DLL from its install directory at runtime, which is
+# what makes delay loading useful: WinFsp's installer does not put its bin
+# directory on PATH.
+libloading = "0.8"
+
+[target.'cfg(windows)'.build-dependencies]
+winfsp = { version = "0.13", features = ["build"] }

@@ -1,0 +1,23 @@
+[package]
+name = "mydrives-backend-smb"
+description = "SMB2/3 (NAS, Windows share) backend for MyDrives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mydrives-core.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# Pure-Rust SMB2/3 client: no libsmbclient, so the same code builds on Windows,
+# macOS and Linux. (pavao/libsmbclient would be UNIX-only and needs Samba dev
+# packages on every build host.)
+smb = "0.12"
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

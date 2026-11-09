@@ -1,0 +1,143 @@
+# Tag a version, get binaries.
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# Every executable is published as a plain file named `<binary>-<target>`, plus
+# one `SHA256SUMS` for the whole release. That is exactly what the agent's
+# updater expects (crates/mydrives-core/src/update.rs): no archive to unpack,
+# one checksum file to verify against.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets a failed release be re-run without moving the tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The updater compares the release tag with the version compiled into the
+  # binary. If they disagree, every client would re-download the same release
+  # forever, so the mismatch is caught before anything is built.
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the workspace version
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "tag=$tag workspace version=$version"
+          test "$tag" = "v$version"
+
+  build:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          # Apple Silicon runners cross-compile the Intel slice happily; a
+          # separate Intel runner would only cost minutes.
+          - os: macos-14
+            target: x86_64-apple-darwin
+          # Windows ships as x64 only - it runs under emulation on ARM64
+          # Windows, and WinFsp installs winfsp-x64.dll there too.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # `winfsp-sys` generates its bindings with bindgen, which needs libclang.
+      # The Windows runners ship LLVM; this only points at it.
+      - name: Point bindgen at the runner's LLVM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: Build
+        run: >
+          cargo build --release --features tray
+          --target ${{ matrix.target }}
+          -p mydrives-daemon -p mydrives-cli -p mydrives-ui
+
+      - name: Test
+        run: cargo test --release --features tray --workspace --target ${{ matrix.target }}
+
+      - name: Package (macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          for b in mydrivesd mydrives mydrives-ui; do
+            cp "target/${{ matrix.target }}/release/$b" "dist/$b-${{ matrix.target }}"
+          done
+          cd dist
+          shasum -a 256 mydrives* > "SHA256SUMS.${{ matrix.target }}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          foreach ($b in "mydrivesd", "mydrives", "mydrives-ui") {
+            Copy-Item "target/${{ matrix.target }}/release/$b.exe" "dist/$b-${{ matrix.target }}.exe"
+          }
+          Set-Location dist
+          Get-ChildItem -File -Filter "mydrives*" | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower(), $_.Name
+          } | Set-Content -Encoding ascii "SHA256SUMS.${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect the binaries and merge the checksums
+        run: |
+          mkdir -p dist
+          find artifacts -type f -name 'mydrives*' -exec cp {} dist/ \;
+          cat artifacts/*/SHA256SUMS.* > dist/SHA256SUMS
+          ls -l dist
+          cat dist/SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" dist/* \
+              --repo "$GITHUB_REPOSITORY" --title "$tag" --generate-notes
+          fi
