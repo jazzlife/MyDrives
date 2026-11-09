@@ -151,11 +151,11 @@ impl MountProvider for FuseProvider {
             //
             // What the sidebar prints, though, is the *server* the volume came
             // from, and that defaults to "fuse-t" for every drive. `location`
-            // renames it, so the row reads like the drive - and drives whose
-            // name has no ASCII to work with gather under "MyDrives" instead.
-            let location =
-                location_name(&spec.volume_name).unwrap_or_else(|| "MyDrives".to_string());
-            options.push(MountOption::CUSTOM(format!("location={location}")));
+            // renames it, so the row reads like the drive.
+            options.push(MountOption::CUSTOM(format!(
+                "location={}",
+                location_name(&spec.volume_name)
+            )));
             // Keeps macOS from littering the remote with `._` sidecar files.
             options.push(MountOption::CUSTOM("noappledouble".into()));
         } else {
@@ -448,15 +448,21 @@ impl FuseFs {
 /// `거북이-NAS` is accepted by FUSE-T and then never resolves, and the mount
 /// dies with "Short read of FUSE request header". Whitespace becomes `-`
 /// (FUSE-T splits the mount command on spaces), everything outside
-/// `A-Za-z0-9._-` is dropped, and the result is capped at a DNS label's 63
-/// bytes. A name with nothing left - a Korean-only one - gets no name at all;
-/// the caller falls back to the application's.
+/// `A-Za-z0-9._-` is dropped, and a DNS label has 63 bytes to spend.
+///
+/// It carries the application's name in front of the drive's, because what is
+/// left of a drive called "거북이 NAS" is "NAS" - and a real NAS answering to
+/// that name on the same network would take the mount with it. A drive with
+/// nothing usable left keeps the application's name alone.
 // Only the FUSE-T branch calls it; the tests cover it everywhere.
 #[cfg_attr(
     not(all(target_os = "macos", feature = "macfuse")),
     allow(dead_code)
 )]
-fn location_name(volume_name: &str) -> Option<String> {
+fn location_name(volume_name: &str) -> String {
+    const APP: &str = "MyDrives";
+    const LABEL_MAX: usize = 63;
+
     let mut out = String::new();
     for ch in volume_name.trim().chars() {
         let ch = if ch.is_whitespace() { '-' } else { ch };
@@ -466,13 +472,15 @@ fn location_name(volume_name: &str) -> Option<String> {
         if ch == '-' && out.ends_with('-') {
             continue;
         }
-        if out.len() == 63 {
+        if APP.len() + 1 + out.len() == LABEL_MAX {
             break;
         }
         out.push(ch);
     }
-    let trimmed = out.trim_matches(['-', '.', '_']);
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    match out.trim_matches(['-', '.', '_']) {
+        "" => APP.to_string(),
+        name => format!("{APP}-{name}"),
+    }
 }
 
 fn errno(e: &Error) -> Errno {
@@ -880,14 +888,15 @@ mod tests {
     #[test]
     fn location_name_survives_the_mount_command_and_bonjour() {
         // The space is what used to tear FUSE-T's mount command in half.
-        assert_eq!(location_name("  Office  NAS  ").as_deref(), Some("Office-NAS"));
-        assert_eq!(location_name("backup/2025:주말").as_deref(), Some("backup2025"));
+        assert_eq!(location_name("  Office  NAS  "), "MyDrives-Office-NAS");
+        assert_eq!(location_name("backup/2025:주말"), "MyDrives-backup2025");
         // Bonjour has to resolve the name, and a non-ASCII one never does.
-        assert_eq!(location_name("거북이 NAS").as_deref(), Some("NAS"));
-        assert_eq!(location_name("거북이").as_deref(), None);
-        assert_eq!(location_name("   ").as_deref(), None);
-        assert_eq!(location_name("///").as_deref(), None);
-        assert_eq!(location_name(&"n".repeat(100)).unwrap().len(), 63);
+        // "NAS" on its own is also what the NAS in the hall answers to.
+        assert_eq!(location_name("거북이 NAS"), "MyDrives-NAS");
+        assert_eq!(location_name("거북이"), "MyDrives");
+        assert_eq!(location_name("   "), "MyDrives");
+        assert_eq!(location_name("///"), "MyDrives");
+        assert_eq!(location_name(&"n".repeat(100)).len(), 63);
     }
 
     #[test]

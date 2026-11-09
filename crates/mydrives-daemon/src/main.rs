@@ -224,13 +224,16 @@ fn providers() -> Vec<Arc<dyn MountProvider>> {
     let mut out: Vec<Arc<dyn MountProvider>> = Vec::new();
     #[cfg(windows)]
     out.push(Arc::new(mydrives_mount_windows::WinFspProvider::new()));
-    // macOS first tries the in-box NFS client: no kernel extension to install,
-    // no third-party licence. FUSE is preferred on Linux, where it is native.
+    // macOS prefers FUSE-T: it needs no kernel extension either, and it is the
+    // one that reaches Finder's sidebar, where a drive belongs. Its `probe`
+    // fails when FUSE-T is not installed, and then the in-box NFS client takes
+    // over - a working drive, just not one Finder lists. FUSE is preferred on
+    // Linux too, where it is native.
     #[cfg(target_os = "macos")]
     {
-        out.push(Arc::new(mydrives_mount_nfs::NfsProvider::new()));
         #[cfg(feature = "macfuse")]
         out.push(Arc::new(mydrives_mount_fuse::FuseProvider::new()));
+        out.push(Arc::new(mydrives_mount_nfs::NfsProvider::new()));
     }
     #[cfg(target_os = "linux")]
     {
@@ -798,13 +801,13 @@ async fn ensure_mount_layer(config: &Arc<Mutex<AppConfig>>, remote: Option<&Remo
     use std::sync::atomic::{AtomicBool, Ordering};
     static TRIED: AtomicBool = AtomicBool::new(false);
 
+    // A drive that does not name a provider gets the default one, which on
+    // macOS is FUSE - so it wants FUSE-T too. Only a drive pinned to another
+    // provider does not.
+    let wants_fuse = |r: &RemoteConfig| r.provider.as_deref().unwrap_or("fuse") == "fuse";
     let wants_fuse = match remote {
-        Some(r) => r.provider.as_deref() == Some("fuse"),
-        None => config
-            .lock()
-            .remotes
-            .iter()
-            .any(|r| r.provider.as_deref() == Some("fuse")),
+        Some(r) => wants_fuse(r),
+        None => config.lock().remotes.iter().any(wants_fuse),
     };
     let auto_install = config.lock().general.fuse_t_auto_install;
     if !mydrives_core::fuse_t::should_install(

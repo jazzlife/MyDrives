@@ -300,6 +300,17 @@ impl MountManager {
                     .arg(if cfg!(target_os = "macos") { "-f" } else { "-l" })
                     .arg(path)
                     .output();
+                // macOS removes the directory it made for the old volume a
+                // moment *after* the unmount - which is after we would have
+                // recreated it. The new mount then has no mount point and
+                // fails ("exit status 66" out of mount_smbfs), so the tidying
+                // up has to finish first.
+                for _ in 0..20 {
+                    if !is_mount_point(path) && !path.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
             }
             create_mount_point(path)?;
         }
