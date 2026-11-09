@@ -262,6 +262,8 @@ fn wait_until_mounted(path: &std::path::Path, timeout: Duration) -> bool {
     }
 }
 
+/// Only the Linux probe looks for the setuid mount helper; macOS has FUSE-T.
+#[cfg(not(target_os = "macos"))]
 fn which(bin: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)

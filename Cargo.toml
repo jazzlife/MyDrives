@@ -11,6 +11,11 @@ members = [
   "crates/mydrives-cli",
   "crates/mydrives-ui",
 ]
+# A path dependency inside the workspace joins it by default, which would make
+# `cargo test --workspace` build the vendored fuser on its own - and on Windows
+# that fails looking for libfuse. It is a dependency of the FUSE provider on the
+# platforms that have one, and nothing else.
+exclude = ["vendor/fuser"]
 
 [workspace.package]
 version = "0.1.2"

@@ -12,7 +12,9 @@
 use std::path::PathBuf;
 
 /// Maximum size of a log file before it is started over, so a login loop
-/// cannot fill the disk.
+/// cannot fill the disk. Only Windows writes one; elsewhere launchd and the
+/// terminal own the output.
+#[cfg(windows)]
 const MAX_LOG_BYTES: u64 = 4 << 20;
 
 #[cfg(windows)]

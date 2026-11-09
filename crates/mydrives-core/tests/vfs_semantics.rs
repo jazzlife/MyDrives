@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use mydrives_core::backends::mem::{fixture, MemBackend};
 use mydrives_core::types::{FileKind, OpenOpts, SetAttr};
-use mydrives_core::{Backend, RPath, Vfs, VfsOptions, ROOT_INO};
+use mydrives_core::{RPath, Vfs, VfsOptions, ROOT_INO};
 
 fn vfs(backend: MemBackend) -> Arc<Vfs> {
     Vfs::new(Arc::new(backend), VfsOptions::default())
