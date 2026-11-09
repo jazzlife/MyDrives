@@ -14,13 +14,17 @@
 
 use std::path::Path;
 
-use crate::error::{Error, Result};
+#[cfg(target_os = "macos")]
+use crate::error::Error;
+use crate::error::Result;
 
 /// The dynamic library the mount provider links against, weakly, so that a Mac
 /// without FUSE-T still runs the agent.
 pub const LIBRARY: &str = "/usr/local/lib/libfuse-t.dylib";
 
-/// Where the official packages are published.
+/// Where the official packages are published. Only the installer reads it,
+/// and only macOS has one.
+#[cfg(target_os = "macos")]
 const RELEASES: &str = "https://api.github.com/repos/macos-fuse-t/fuse-t/releases/latest";
 
 pub fn is_installed() -> bool {

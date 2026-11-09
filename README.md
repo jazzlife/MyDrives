@@ -46,7 +46,7 @@ Rust 코어 하나에 OS별 마운트 어댑터를 붙이는 구조입니다. �
 ```bash
 cargo build --release                     # 에이전트 + CLI (헤드리스)
 cargo build --release --features tray     # 트레이/메뉴바 포함 (데스크탑 배포용)
-cargo test --workspace --features tray    # 단위·통합 테스트 (macOS 82 / Windows 74)
+cargo test --workspace --features tray    # 단위·통합 테스트 (macOS 82 · FUSE-T 빌드 86 / Windows 76)
 ```
 
 요구사항
