@@ -503,11 +503,9 @@ impl eframe::App for App {
 
 impl App {
     fn draw_sidebar(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            ui.label(RichText::new("MyDrives").size(14.0).strong().color(p.text));
-        });
-        ui.add_space(8.0);
+        // 앱 이름은 창 제목줄에 이미 있습니다. 머리말로 한 번 더 적으면 같은
+        // 글자가 위아래로 겹쳐 보이기만 하고, 목록 자리를 빼앗습니다.
+        ui.add_space(2.0);
 
         let list_height = (ui.available_height() - 44.0).max(80.0);
         egui::ScrollArea::vertical()
