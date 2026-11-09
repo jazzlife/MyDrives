@@ -28,7 +28,7 @@ Rust 코어 하나에 OS별 마운트 어댑터를 붙이는 구조입니다. �
 | 백엔드 트레이트 + 인메모리 참조 구현 | ✅ |
 | **NAS (SMB2/3) 백엔드** — 순수 Rust, 3 OS 공용 | ✅ 실 서버 검증 |
 | VFS (inode·핸들·메타데이터 캐시·읽기 청크·쓰기 epoch) | ✅ |
-| **macOS 마운트** — 내장 NFS 클라이언트(커널 익스텐션 불필요) | ✅ 실기 검증 |
+| **macOS 마운트** — FUSE-T(커널 익스텐션 불필요), 폴백은 내장 NFS 클라이언트 | ✅ 실기 검증 (Finder 사이드바 등록 포함) |
 | **Windows 마운트** — WinFsp | ✅ x64 실마운트 검증 (Windows 11에서 드라이브 문자 `Z:`) |
 | Linux 마운트 — FUSE (개발·CI용) | ✅ 구현 |
 | 트레이 / 메뉴바 UI | ✅ 구현 (`--features tray`) |
@@ -53,8 +53,8 @@ cargo test --workspace --features tray    # 단위·통합 테스트 (macOS 82 /
 
 | OS | 마운트 계층 | 추가 설치 |
 |---|---|---|
-| macOS 13+ | 내장 NFS 클라이언트 | **없음** |
-| macOS (선택) | FUSE-T (Finder 사이드바용) | 에이전트가 자동 설치, 또는 `mydrives fuse-t --install` |
+| macOS 13+ | FUSE-T (Finder 사이드바에 드라이브로 뜹니다) | 에이전트가 자동 설치, 또는 `mydrives fuse-t --install` |
+| macOS (폴백) | 내장 NFS 클라이언트 | **없음** |
 | Windows 10/11 | WinFsp 2.x | [winfsp.dev/rel](https://winfsp.dev/rel/) + LLVM(빌드 시) |
 | Linux | FUSE | `fusermount`(fuse2/3) 또는 root |
 
@@ -136,27 +136,32 @@ NAS 이름은 주소에서 가져옵니다(`turtlelab.ddns.net` → `turtlelab`)
 
 ## macOS 마운트 계층 (FUSE-T)
 
-기본값은 내장 NFS 클라이언트라 **아무것도 설치할 필요가 없습니다**. 다만 그렇게
-마운트한 볼륨은 Finder 사이드바에 올라가지 않습니다(macOS 26에서 측정: 사이드바
-"위치"는 DiskArbitration이 아는 디스크와 NetFS로 마운트한 서버만 올립니다).
+드라이브는 FUSE-T로 마운트합니다. 커널 익스텐션이 아니고, **Finder 사이드바에
+드라이브로 올라오는 유일한 경로**입니다(macOS 26에서 측정: 사이드바 "위치"는
+DiskArbitration이 아는 디스크와 NetFS로 마운트한 서버만 올립니다. 루프백 NFS
+마운트는 어느 쪽도 아닙니다).
 
-사이드바에 드라이브로 띄우려면 드라이브에 `provider = "fuse"` 를 지정하면 되고,
 **FUSE-T가 없으면 에이전트가 설치합니다** — GitHub의 최신 릴리즈를 받아
 `installer`에 넘기고, 그때 뜨는 관리자 암호 창이 동의 절차입니다. 설치를 취소하면
-기존 NFS 계층으로 계속 동작합니다.
+내장 NFS 클라이언트로 마운트합니다(동작은 같고, 사이드바에만 안 올라옵니다).
+
+처음 마운트할 때 macOS가 **"mydrivesd가 로컬 네트워크의 기기를 찾도록 허용"**
+을 한 번 묻습니다. FUSE-T가 Bonjour로 볼륨을 붙이기 때문이고, 거부하면 마운트가
+실패합니다. 사이드바에 보이려면 Finder 설정 → 사이드바 → **"연결된 서버"** 도
+켜져 있어야 합니다(기본은 꺼져 있을 수 있습니다). 사이드바 행 이름은 볼륨이 아니라
+서버라, `MyDrives-<드라이브 이름>` 으로 올라옵니다.
 
 ```bash
 mydrives fuse-t              # 설치 여부와 버전
 mydrives fuse-t --install    # 지금 설치
 ```
 
-`[general] fuse_t_auto_install = false` 로 자동설치를 끌 수 있습니다. 설치는
-`provider = "fuse"` 를 지정한 드라이브를 마운트할 때만 시도하므로, 쓰지 않는
-사람에게 암호를 묻지 않습니다.
+`[general] fuse_t_auto_install = false` 로 자동설치를 끌 수 있습니다. 드라이브에
+`provider = "nfs"` 를 지정해 두면 그 드라이브는 FUSE-T를 쓰지 않고, 설치도 묻지
+않습니다.
 
-> **현재 상태**: 설치·감지·연동(FUSE 핸드셰이크, STATFS, GETATTR)까지 동작하지만
-> FUSE-T가 자기 NFS/SMB 백엔드로 볼륨을 올리는 마지막 단계가 아직 완료되지
-> 않습니다. 그때까지 드라이브는 NFS 계층으로 마운트됩니다.
+실기 검증(QNAP, macOS 26): 사이드바 등록, 복사·이동·이름 변경·삭제, 8 MiB 복사
+바이트 일치, sqlite·git·tar·rsync, `scripts/verify-posix.sh mem` 56/56.
 
 ### FUSE-T로 빌드하기
 

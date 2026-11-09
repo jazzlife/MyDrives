@@ -59,7 +59,7 @@ WinFsp 미설치 머신에서 `mydrivesd.exe`가 로드 시점에 `winfsp-x64.dl
 
 ---
 
-## 3. macOS 마운트: 내장 NFS 클라이언트 (커널 익스텐션 없음)
+## 3. macOS 마운트: FUSE-T 우선, 내장 NFS 폴백 (둘 다 커널 익스텐션 없음)
 
 | 후보 | 설치 부담 | 라이선스 | 비고 |
 |---|---|---|---|
@@ -96,6 +96,41 @@ WinFsp 미설치 머신에서 `mydrivesd.exe`가 로드 시점에 `winfsp-x64.dl
 - `nolocks`로 두면 `fcntl` 락이 실패해 **SQLite가 "disk I/O error"** 를 냅니다
   (실제 재현). macOS는 `locallocks`, Linux는 `nolock`(= 클라이언트 로컬 락)으로
   전환해 해결했습니다. 단일 사용자 드라이브 전제이므로 로컬 락으로 충분합니다.
+
+### 3-2. 기본값을 FUSE-T로 바꿈 (2026-11-10)
+
+루프백 NFS 마운트는 **Finder 사이드바에 절대 올라오지 않습니다**. 측정으로 확인한
+이유는 Finder의 "위치"가 DiskArbitration 볼륨과 NetFS로 붙은 서버만 나열하기
+때문이고, `LSSharedFileList`는 macOS 26에서 빈 껍데기입니다. 사용자의 요구가
+"외장하드처럼 드라이브로 뜨는 것"이라 기본 계층을 FUSE-T로 옮겼습니다. FUSE-T도
+kext가 아니고, `probe()`가 미설치를 알려주면 그대로 NFS로 내려갑니다(설정에서
+드라이브에 `provider`를 못 박으면 그 값이 우선).
+
+사이드바에 보이려면 Finder 설정 → 사이드바 → **"연결된 서버"** 가 켜져 있어야
+합니다. 이 Mac은 꺼져 있었고, 켜자 바로 나타났습니다. 행 이름은 볼륨이 아니라
+**서버** 이름이라 `location` 옵션으로 드라이브 이름을 넣습니다.
+
+FUSE-T에 맞추느라 고친 것들(모두 재현 후 수정):
+
+| 증상 | 원인 | 조치 |
+|---|---|---|
+| 목록이 `bad file descriptor` | `opendir`가 핸들 0을 돌려줌 | 0이 아닌 핸들, 그리고 VFS 파일 핸들과 겹치지 않게 최상위 비트 사용 |
+| 첫 복사에서 `fcopyfile failed` + **파일 깨짐** | 루트 디렉터리 핸들과 첫 파일 핸들이 같은 1 | 위와 동일 |
+| `mv`·`ditto`·`rsync`가 "Permission denied" | 벤더 fuser가 macFUSE 4의 16바이트 `fuse_rename_in`을 읽어 이름이 8바이트 밀림 → ENOSYS | `macfuse-4-compat`을 `apple-abi`에 묶음 |
+| 32KiB 쓰기에서 멈춤 | FUSE-T 채널은 소켓이라 요청이 쪼개져 도착 | 헤더 길이만큼 마저 읽음 |
+| 언마운트 후 에이전트가 안 끝남 | 헬퍼가 소켓을 계속 열어 둠 | 언마운트 때 소켓 shutdown, EOF를 세션 종료로 처리 |
+| sqlite 실패 | `setlk`/`getlk` 미구현 | 마운트 계층에 범위 잠금 테이블 (이 Mac의 모든 프로그램이 이 서버 하나를 거치므로 로컬 락이 곧 상호 배제) |
+| 마운트 직후 경로가 빈 디렉터리 | 볼륨은 헬퍼가 1~2초 뒤에 붙임 | 마운트 테이블에 보일 때까지 기다린 뒤 성공 보고 |
+| 재시작 후 `mount_smbfs` exit 66 | 묵은 마운트를 풀면 macOS가 `/Volumes/<이름>`을 **나중에** 지움 | 정리가 끝난 뒤 디렉터리 생성 |
+
+이름 규칙: Bonjour 이름(`<location>._smb._tcp.local`)으로 들어가므로 ASCII만,
+공백은 `-`(FUSE-T가 마운트 명령을 공백으로 쪼갭니다). 한글 이름이나 공백이 들어가면
+마운트가 "Short read of FUSE request header"로 죽는 것을 확인했습니다. 앞에
+`MyDrives-`를 붙이는 이유는 "거북이 NAS"에서 남는 것이 `NAS`뿐이라 같은 망의 진짜
+NAS와 이름이 부딪히기 때문입니다.
+
+처음 마운트할 때 macOS가 **"mydrivesd가 로컬 네트워크의 기기를 찾도록 허용"**
+을 묻습니다. FUSE-T가 Bonjour로 붙기 때문이며, 거부하면 마운트가 실패합니다.
 
 ---
 
