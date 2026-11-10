@@ -304,9 +304,16 @@ impl Form {
     /// 공유 폴더 이름을 따릅니다 — 이름은 "어느 장비인가"를, 경로는 "어느
     /// 폴더인가"를 말해야 하기 때문입니다.
     fn follow_sources(&mut self, taken: &[String], taken_ids: &[String]) {
+        // 주소 칸에 포트까지 붙여 적는 것이 보통입니다 - 서버가 알려주는 모양이
+        // "nas.example.com:5445"이기 때문입니다. 받아서 갈라 놓습니다.
+        if let Some((host, port)) = split_host_port(&self.host) {
+            self.host = host;
+            self.port = port.to_string();
+            self.port_edited = true;
+        }
         // SMB는 공유 폴더가, FTP는 계정 안의 경로가 "어느 폴더인가"에 해당합니다.
         let share = match self.kind {
-            DriveKind::Smb => self.share.trim().to_string(),
+            DriveKind::Smb => clean_share(&self.share),
             DriveKind::Ftp => self.subpath.trim().to_string(),
         };
         if !self.port_edited {
@@ -379,7 +386,19 @@ impl Form {
         Ok(())
     }
 
+    /// 폼의 값을 프로토콜이 받아들이는 모양으로 다듬어 돌려줍니다.
+    ///
+    /// 사람은 주소 칸에 포트를 붙여 적고, 공유 폴더를 `/jazzlife` 처럼 경로로
+    /// 적습니다. 그대로 넘기면 SMB가 `bad SMB target: Share name...` 으로
+    /// 거절하는데, 그건 사용자가 틀린 게 아니라 받아 적는 쪽이 할 일을 안 한
+    /// 것입니다.
     fn to_remote(&self) -> RemoteConfig {
+        let (host, split_port) = match split_host_port(&self.host) {
+            Some((host, port)) => (host, Some(port)),
+            None => (self.host.trim().to_string(), None),
+        };
+        let typed_port = self.port.trim().parse::<u16>().ok();
+        let port = split_port.or(typed_port);
         RemoteConfig {
             id: self.id.trim().to_string(),
             // 비워 두면 에이전트가 제품 이름으로 채웁니다.
@@ -391,19 +410,19 @@ impl Form {
             mountpoint: opt(&self.mountpoint),
             backend: match self.kind {
                 DriveKind::Smb => BackendConfig::Smb(SmbConfig {
-                    host: self.host.trim().to_string(),
-                    port: self.port.trim().parse().unwrap_or(445),
-                    share: self.share.trim().to_string(),
+                    host: host.clone(),
+                    port: port.unwrap_or(445),
+                    share: clean_share(&self.share),
                     user: self.user.trim().to_string(),
-                    subpath: opt(&self.subpath),
+                    subpath: clean_subpath(&self.subpath),
                     // 저장은 에이전트가 OS 키체인에 합니다.
                     secret: SecretRef::Keychain,
                 }),
                 DriveKind::Ftp => BackendConfig::Ftp(FtpConfig {
-                    host: self.host.trim().to_string(),
-                    port: self.port.trim().parse().unwrap_or(21),
+                    host: host.clone(),
+                    port: port.unwrap_or(21),
                     user: self.user.trim().to_string(),
-                    subpath: opt(&self.subpath),
+                    subpath: clean_subpath(&self.subpath),
                     security: self.security.clone(),
                     mode: self.mode.clone(),
                     passive_nat_workaround: self.nat_workaround,
@@ -415,6 +434,51 @@ impl Form {
             },
         }
     }
+}
+
+/// `nas.example.com:5445` 처럼 포트가 붙어 들어온 주소를 갈라 놓습니다.
+///
+/// NAS 관리 화면도, 공유 주소도 포트를 붙여 보여 주므로 사람은 그대로 붙여
+/// 넣습니다. IPv6 주소(`[::1]:445`)와 포트 없는 주소는 건드리지 않습니다.
+fn split_host_port(raw: &str) -> Option<(String, u16)> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.starts_with('[') {
+        return None;
+    }
+    let (host, port) = raw.rsplit_once(':')?;
+    // IPv6 주소에는 콜론이 여러 개입니다 - 포트가 아니라 주소의 일부입니다.
+    if host.contains(':') || host.trim().is_empty() {
+        return None;
+    }
+    let port: u16 = port.trim().parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    Some((host.trim().to_string(), port))
+}
+
+/// 공유 이름에서 경로 구분자를 떼어 냅니다.
+///
+/// 사람은 공유를 `/jazzlife` 나 `\\nas\jazzlife` 처럼 경로로 적지만, SMB가
+/// 받는 것은 이름 하나입니다. 그대로 넘기면 `bad SMB target: Share name...`.
+fn clean_share(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// 하위 경로는 항상 `/`로 시작하는 한 줄로 만듭니다.
+fn clean_subpath(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().replace('\\', "/");
+    let trimmed = trimmed.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!("/{trimmed}"))
 }
 
 fn opt(value: &str) -> Option<String> {
@@ -1289,7 +1353,10 @@ impl App {
                 ui.label(RichText::new(format!("{}...", busy.label)).color(p.dim));
             } else if let Some((text, is_error)) = self.message.clone() {
                 let color = if is_error { p.err } else { p.ok };
-                ui.label(RichText::new(ellipsize(&text, 70)).color(color));
+                // 잘라 버리면 정작 원인이 적힌 뒷부분이 사라집니다 - 줄 안에서는
+                // 줄이되, 가리키면 전문을 보여 줍니다.
+                ui.label(RichText::new(ellipsize(&text, 70)).color(color))
+                    .on_hover_text(&text);
             } else {
                 ui.label(
                     RichText::new("비밀번호는 OS 키체인에 저장되며 설정 파일에 남지 않습니다")
@@ -1597,6 +1664,61 @@ mod tests {
     /// 사용자가 실제로 당한 일: NAS 드라이브 `jazzlife`가 있는데 같은 계정의
     /// FTP를 `/jazzlife` 폴더로 추가했더니, 기본 이름이 똑같이 `jazzlife`라
     /// **기존 NAS 드라이브 설정이 통째로 교체**됐습니다.
+    /// 사용자가 실제로 친 입력: 주소 칸에 포트까지, 공유 폴더에 `/`를 붙여서.
+    /// 이걸 그대로 넘기면 SMB가 `bad SMB target: Share name...` 으로 거절합니다.
+    #[test]
+    fn the_form_accepts_what_people_actually_type() {
+        let mut form = Form {
+            home: "/Users/x".into(),
+            ..Form::default()
+        };
+        form.host = "turtlelab.ddns.net:5545".into();
+        form.share = "/jazzlife".into();
+        form.user = "jazzlife".into();
+        form.follow_sources(&[], &[]);
+
+        // 주소와 포트가 갈라집니다.
+        assert_eq!(form.host, "turtlelab.ddns.net");
+        assert_eq!(form.port, "5545");
+        // 드라이브 이름과 마운트 경로에 슬래시가 섞이지 않습니다.
+        assert_eq!(form.id, "jazzlife");
+        if !cfg!(windows) {
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/jazzlife");
+        }
+
+        match form.to_remote().backend {
+            BackendConfig::Smb(smb) => {
+                assert_eq!(smb.host, "turtlelab.ddns.net");
+                assert_eq!(smb.port, 5545);
+                assert_eq!(smb.share, "jazzlife");
+            }
+            _ => panic!("SMB 백엔드여야 합니다"),
+        }
+    }
+
+    #[test]
+    fn addresses_and_shares_are_tidied_without_being_mangled() {
+        // 포트가 없는 주소, IPv6 주소는 그대로 둡니다.
+        assert_eq!(split_host_port("nas.example.com"), None);
+        assert_eq!(split_host_port("[fe80::1]:445"), None);
+        assert_eq!(split_host_port("fe80::1"), None);
+        assert_eq!(
+            split_host_port("192.168.0.10:445"),
+            Some(("192.168.0.10".to_string(), 445))
+        );
+
+        // 공유 이름은 경로로 적어도 이름 하나로 추려집니다.
+        assert_eq!(clean_share("/jazzlife"), "jazzlife");
+        assert_eq!(clean_share("\\\\nas\\jazzlife"), "jazzlife");
+        assert_eq!(clean_share("  Public/  "), "Public");
+        assert_eq!(clean_share(""), "");
+
+        // 하위 경로는 항상 / 로 시작합니다.
+        assert_eq!(clean_subpath("photos/2026"), Some("/photos/2026".into()));
+        assert_eq!(clean_subpath("/photos/"), Some("/photos".into()));
+        assert_eq!(clean_subpath("   "), None);
+    }
+
     #[test]
     fn a_new_drive_never_takes_a_name_another_drive_is_using() {
         let mut form = Form {
