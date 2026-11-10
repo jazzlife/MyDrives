@@ -18,6 +18,12 @@
 //!   command with the previous transfer's reply. A stream that is abandoned
 //!   mid-file therefore takes its connection with it instead of returning it to
 //!   the pool.
+//! * **Writing at an offset does not exist at all.** `REST` before `STOR` looks
+//!   like it, but what a server makes of it is unspecified, and the mount
+//!   layers do not write in order anyway - the NFS layer hands a 1 MiB copy
+//!   down as eight 128 KiB writes with the tail shuffled. Writes therefore go
+//!   to a staging file on local disk and travel to the server as one sequential
+//!   `STOR` on flush or close; see [`Staged`].
 //! * **No exclusive create, no atomic replace.** `STOR` overwrites silently and
 //!   `RNFR`/`RNTO` fails if the target exists on most servers, so `create` and
 //!   `rename` check first. That is a race no FTP server offers a way to close.
@@ -35,7 +41,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use suppaftp::tokio::{AsyncNoTlsStream, AsyncRustlsStream, ImplAsyncFtpStream, TransferStream};
@@ -252,28 +258,56 @@ impl<T: Transport> Pool<T> {
     }
 }
 
-/// A transfer bound to an open file, with the position it has reached.
-enum Transfer<T: Transport> {
-    Read {
-        lease: Lease<T>,
-        stream: TransferStream<T>,
-        pos: u64,
-        /// The server has sent everything; the next read returns nothing.
-        eof: bool,
-    },
-    Write {
-        lease: Lease<T>,
-        stream: TransferStream<T>,
-        pos: u64,
-    },
+/// A download in progress, with the position it has reached.
+struct Transfer<T: Transport> {
+    lease: Lease<T>,
+    stream: TransferStream<T>,
+    pos: u64,
+    /// The server has sent everything; the next read returns nothing.
+    eof: bool,
+}
+
+/// An open file's contents on local disk while it is being written.
+///
+/// FTP has no way to write at an offset. `REST` before `STOR` looks like one,
+/// but what the server does with it is not specified and servers disagree -
+/// measured against a real server, writes that arrived out of order left the
+/// file correct up to the first gap and zero-filled after it. And they *do*
+/// arrive out of order: the NFS mount layer hands down a 1 MiB copy as eight
+/// 128 KiB writes with the last four shuffled.
+///
+/// So writes land in a temporary file - random access, no protocol involved -
+/// and the whole thing is uploaded in one sequential `STOR` when the file is
+/// flushed or closed. This is write-back: data written but not yet flushed
+/// lives only on this machine, which is the trade every FTP mount makes
+/// (rclone and curlftpfs stage the same way).
+struct Staged {
+    file: tokio::fs::File,
+    path: std::path::PathBuf,
+    len: u64,
+    /// Something was written that the server has not been given yet.
+    dirty: bool,
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        // The upload has either happened or failed by now; either way the copy
+        // on disk must not outlive the handle.
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 struct OpenFile<T: Transport> {
     path: RPath,
     opts: OpenOpts,
-    /// At most one transfer per open file, and only one caller at a time may
+    /// This handle created the file, or truncated it, so there is nothing on
+    /// the server worth downloading before the first write.
+    starts_empty: bool,
+    /// At most one download per open file, and only one caller at a time may
     /// touch it - `read_at` mutates the stream position.
     transfer: tokio::sync::Mutex<Option<Transfer<T>>>,
+    /// Where writes go until the file is flushed.
+    staged: tokio::sync::Mutex<Option<Staged>>,
 }
 
 pub struct FtpBackend<T: Transport> {
@@ -326,6 +360,22 @@ impl<T: Transport> FtpBackend<T> {
         } else {
             format!("{base}{rel}")
         }
+    }
+
+    /// Records a new open file and hands back its handle.
+    fn register(&self, path: RPath, opts: OpenOpts, starts_empty: bool) -> BFile {
+        let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.open.lock().insert(
+            id,
+            Arc::new(OpenFile {
+                path,
+                opts,
+                starts_empty,
+                transfer: tokio::sync::Mutex::new(None),
+                staged: tokio::sync::Mutex::new(None),
+            }),
+        );
+        BFile(id)
     }
 
     fn handle(&self, f: BFile) -> Result<Arc<OpenFile<T>>> {
@@ -431,39 +481,132 @@ impl<T: Transport> FtpBackend<T> {
         stream.finish().await.map_err(|e| map_ftp_path_error(e, path))
     }
 
-    /// Ends whatever transfer an open file is holding.
+    /// Ends whatever download an open file is holding.
     ///
     /// A read that stopped before the end of the file leaves the server mid-send
     /// with no reliable way to resynchronise, so that connection is dropped
     /// rather than pooled.
     async fn end_transfer(&self, transfer: Option<Transfer<T>>) -> Result<()> {
-        match transfer {
-            None => Ok(()),
-            Some(Transfer::Read { lease, stream, eof, .. }) => {
-                if eof {
-                    let finished = stream.finish().await;
-                    if finished.is_err() {
-                        lease.discard();
-                    }
-                    Ok(())
-                } else {
-                    drop(stream);
-                    lease.discard();
-                    Ok(())
-                }
+        let Some(Transfer { lease, stream, eof, .. }) = transfer else {
+            return Ok(());
+        };
+        if eof {
+            if stream.finish().await.is_err() {
+                lease.discard();
             }
-            Some(Transfer::Write { mut lease, stream, .. }) => {
-                let result = stream.finish().await;
-                match result {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        let _ = lease.get();
-                        lease.discard();
-                        Err(map_ftp_error(e))
-                    }
+        } else {
+            drop(stream);
+            lease.discard();
+        }
+        Ok(())
+    }
+
+    /// The staging file for an open handle, created (and filled from the
+    /// server) the first time something writes to it.
+    async fn stage(&self, file: &OpenFile<T>, slot: &mut Option<Staged>) -> Result<()> {
+        if slot.is_some() {
+            return Ok(());
+        }
+        // The counter is process-wide, not per backend: two drives (or two
+        // tests) would otherwise hand out the same name and write into one
+        // another's staging file.
+        static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "mydrives-ftp-{}-{}.part",
+            std::process::id(),
+            NEXT_STAGING.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = std::env::temp_dir().join(name);
+        let mut staged = tokio::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(Error::Io)?;
+
+        // A handle that created or truncated the file has nothing to fetch; any
+        // other one is about to modify a file that already has contents, and
+        // the parts it does not write have to survive the upload.
+        let mut len = 0u64;
+        if !file.starts_empty {
+            len = self.download_into(&file.path, &mut staged).await?;
+        }
+        *slot = Some(Staged {
+            file: staged,
+            path,
+            len,
+            dirty: false,
+        });
+        Ok(())
+    }
+
+    /// Streams a whole file from the server into `into`. Returns its length.
+    async fn download_into(&self, path: &RPath, into: &mut tokio::fs::File) -> Result<u64> {
+        let remote = self.remote(path);
+        let mut lease = self.pool.lease().await?;
+        let mut stream = match lease.get().retr_as_stream(remote.as_str()).await {
+            Ok(stream) => stream,
+            // Nothing there yet (another client removed it, or the create is
+            // still only ours): an empty staging file is the right start.
+            Err(e) if is_status(&e, Status::FileUnavailable) => return Ok(0),
+            Err(e) => {
+                lease.discard();
+                return Err(map_ftp_path_error(e, path));
+            }
+        };
+        let copied = tokio::io::copy(&mut stream, into).await;
+        match copied {
+            Ok(n) => {
+                if stream.finish().await.is_err() {
+                    lease.discard();
                 }
+                into.flush().await.map_err(Error::Io)?;
+                Ok(n)
+            }
+            Err(e) => {
+                drop(stream);
+                lease.discard();
+                Err(Error::Io(e))
             }
         }
+    }
+
+    /// Uploads the staging file, if anything was written to it.
+    ///
+    /// One sequential `STOR` from the beginning - the only shape of write FTP
+    /// servers agree on.
+    async fn upload(&self, path: &RPath, staged: &mut Staged) -> Result<()> {
+        if !staged.dirty {
+            return Ok(());
+        }
+        staged.file.flush().await.map_err(Error::Io)?;
+        staged
+            .file
+            .seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(Error::Io)?;
+
+        let remote = self.remote(path);
+        let mut lease = self.pool.lease().await?;
+        let mut stream = lease
+            .get()
+            .put_with_stream(remote.as_str())
+            .await
+            .map_err(|e| map_ftp_path_error(e, path))?;
+        let copied = tokio::io::copy(&mut staged.file, &mut stream).await;
+        if let Err(e) = copied {
+            let _ = stream.finish().await;
+            lease.discard();
+            return Err(Error::Io(e));
+        }
+        stream
+            .finish()
+            .await
+            .map_err(|e| map_ftp_path_error(e, path))?;
+        staged.dirty = false;
+        Ok(())
     }
 }
 
@@ -513,6 +656,16 @@ impl<T: Transport> Backend for FtpBackend<T> {
         self.connected.store(false, Ordering::SeqCst);
         let open: Vec<Arc<OpenFile<T>>> = self.open.lock().drain().map(|(_, v)| v).collect();
         for file in open {
+            // Anything written but not yet flushed gets its last chance here;
+            // after this the connection is gone.
+            let mut slot = file.staged.lock().await;
+            if let Some(staged) = slot.as_mut() {
+                if let Err(e) = self.upload(&file.path, staged).await {
+                    tracing::warn!(path = %file.path.as_str(), error = %e, "연결을 닫기 전에 올리지 못한 변경이 있습니다");
+                }
+            }
+            *slot = None;
+            drop(slot);
             let transfer = file.transfer.lock().await.take();
             let _ = self.end_transfer(transfer).await;
         }
@@ -532,25 +685,17 @@ impl<T: Transport> Backend for FtpBackend<T> {
     }
 
     async fn open(&self, path: &RPath, opts: OpenOpts) -> Result<BFile> {
-        // Opening does not touch the network: the transfer starts at the first
-        // read or write, and that is also when its direction is known.
+        // Opening does not touch the network beyond the stat: a download starts
+        // at the first read, and writes go to a staging file.
         let attr = self.stat_path(path).await?;
         if attr.is_dir() {
             return Err(Error::IsADirectory(path.as_str().to_string()));
         }
-        if opts.truncate && opts.write {
+        let truncated = opts.truncate && opts.write;
+        if truncated {
             self.rewrite(path, &[]).await?;
         }
-        let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.open.lock().insert(
-            id,
-            Arc::new(OpenFile {
-                path: path.clone(),
-                opts,
-                transfer: tokio::sync::Mutex::new(None),
-            }),
-        );
-        Ok(BFile(id))
+        Ok(self.register(path.clone(), opts, truncated))
     }
 
     async fn create(&self, path: &RPath) -> Result<BFile> {
@@ -561,25 +706,37 @@ impl<T: Transport> Backend for FtpBackend<T> {
             return Err(Error::AlreadyExists(path.as_str().to_string()));
         }
         self.rewrite(path, &[]).await?;
-        let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.open.lock().insert(
-            id,
-            Arc::new(OpenFile {
-                path: path.clone(),
-                opts: OpenOpts::read_write(),
-                transfer: tokio::sync::Mutex::new(None),
-            }),
-        );
-        Ok(BFile(id))
+        Ok(self.register(path.clone(), OpenOpts::read_write(), true))
     }
 
     async fn read_at(&self, f: BFile, offset: u64, len: u32) -> Result<Vec<u8>> {
         let file = self.handle(f)?;
+
+        // Reading back what this handle wrote has to see the writes, and they
+        // are on local disk until the flush.
+        {
+            let mut staged = file.staged.lock().await;
+            if let Some(staged) = staged.as_mut() {
+                if offset >= staged.len {
+                    return Ok(Vec::new());
+                }
+                let want = len.min((staged.len - offset) as u32) as usize;
+                let mut buf = vec![0u8; want];
+                staged
+                    .file
+                    .seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(Error::Io)?;
+                staged.file.read_exact(&mut buf).await.map_err(Error::Io)?;
+                return Ok(buf);
+            }
+        }
+
         let mut guard = file.transfer.lock().await;
 
         // A read that continues where the last one stopped rides the open
         // transfer; anything else has to restart it.
-        let continues = matches!(&*guard, Some(Transfer::Read { pos, .. }) if *pos == offset);
+        let continues = matches!(&*guard, Some(Transfer { pos, .. }) if *pos == offset);
         if !continues {
             let previous = guard.take();
             self.end_transfer(previous).await?;
@@ -595,7 +752,7 @@ impl<T: Transport> Backend for FtpBackend<T> {
             }
             match lease.get().retr_as_stream(remote.as_str()).await {
                 Ok(stream) => {
-                    *guard = Some(Transfer::Read {
+                    *guard = Some(Transfer {
                         lease,
                         stream,
                         pos: offset,
@@ -614,8 +771,8 @@ impl<T: Transport> Backend for FtpBackend<T> {
             }
         }
 
-        let Some(Transfer::Read { stream, pos, eof, .. }) = guard.as_mut() else {
-            unreachable!("a read transfer was just installed");
+        let Some(Transfer { stream, pos, eof, .. }) = guard.as_mut() else {
+            unreachable!("a download was just installed");
         };
         if *eof {
             return Ok(Vec::new());
@@ -634,7 +791,7 @@ impl<T: Transport> Backend for FtpBackend<T> {
                     let broken = guard.take();
                     // The data connection died mid-file: the control connection
                     // is no longer trustworthy either.
-                    if let Some(Transfer::Read { lease, stream, .. }) = broken {
+                    if let Some(Transfer { lease, stream, .. }) = broken {
                         drop(stream);
                         lease.discard();
                     }
@@ -652,63 +809,34 @@ impl<T: Transport> Backend for FtpBackend<T> {
         if !file.opts.write {
             return Err(Error::PermissionDenied(file.path.as_str().to_string()));
         }
-        let mut guard = file.transfer.lock().await;
+        // A download of this file would be reading what is about to change.
+        let transfer = file.transfer.lock().await.take();
+        self.end_transfer(transfer).await?;
 
-        let continues = matches!(&*guard, Some(Transfer::Write { pos, .. }) if *pos == offset);
-        if !continues {
-            let previous = guard.take();
-            self.end_transfer(previous).await?;
+        let mut slot = file.staged.lock().await;
+        self.stage(&file, &mut slot).await?;
+        let staged = slot.as_mut().expect("staging was just created");
 
-            let remote = self.remote(&file.path);
-            let mut lease = self.pool.lease().await?;
-            if offset > 0 {
-                // REST before STOR is how a resumed upload works; a server
-                // without it cannot do a write that is not at the start.
-                lease
-                    .get()
-                    .resume_transfer(offset as usize)
-                    .await
-                    .map_err(map_ftp_error)?;
-            }
-            match lease.get().put_with_stream(remote.as_str()).await {
-                Ok(stream) => {
-                    *guard = Some(Transfer::Write {
-                        lease,
-                        stream,
-                        pos: offset,
-                    })
-                }
-                Err(e) => {
-                    lease.discard();
-                    return Err(map_ftp_path_error(e, &file.path));
-                }
-            }
-        }
-
-        let Some(Transfer::Write { stream, pos, .. }) = guard.as_mut() else {
-            unreachable!("a write transfer was just installed");
-        };
-        match stream.write_all(data).await {
-            Ok(()) => {
-                *pos += data.len() as u64;
-                Ok(data.len() as u32)
-            }
-            Err(e) => {
-                let broken = guard.take();
-                if let Some(Transfer::Write { lease, stream, .. }) = broken {
-                    drop(stream);
-                    lease.discard();
-                }
-                Err(Error::Io(e))
-            }
-        }
+        staged
+            .file
+            .seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(Error::Io)?;
+        staged.file.write_all(data).await.map_err(Error::Io)?;
+        staged.len = staged.len.max(offset + data.len() as u64);
+        staged.dirty = true;
+        Ok(data.len() as u32)
     }
 
     async fn flush(&self, f: BFile) -> Result<()> {
-        // An upload is only on disk once the data connection closes and the
-        // server has answered, so flush ends the transfer. A later write simply
-        // starts a new one at the position it left off.
+        // This is where the file reaches the server: everything written so far
+        // goes up in one sequential transfer.
         let file = self.handle(f)?;
+        let mut slot = file.staged.lock().await;
+        if let Some(staged) = slot.as_mut() {
+            self.upload(&file.path, staged).await?;
+        }
+        drop(slot);
         let transfer = file.transfer.lock().await.take();
         self.end_transfer(transfer).await
     }
@@ -716,8 +844,17 @@ impl<T: Transport> Backend for FtpBackend<T> {
     async fn close(&self, f: BFile) -> Result<()> {
         let file = self.open.lock().remove(&f.0);
         let Some(file) = file else { return Ok(()) };
+        let mut slot = file.staged.lock().await;
+        let uploaded = match slot.as_mut() {
+            Some(staged) => self.upload(&file.path, staged).await,
+            None => Ok(()),
+        };
+        // The staging file is removed when it drops, uploaded or not.
+        *slot = None;
+        drop(slot);
         let transfer = file.transfer.lock().await.take();
-        self.end_transfer(transfer).await
+        self.end_transfer(transfer).await?;
+        uploaded
     }
 
     async fn set_len(&self, path: &RPath, f: Option<BFile>, len: u64) -> Result<()> {
@@ -727,6 +864,18 @@ impl<T: Transport> Backend for FtpBackend<T> {
             if let Ok(file) = self.handle(f) {
                 let transfer = file.transfer.lock().await.take();
                 self.end_transfer(transfer).await?;
+
+                // A handle that is being written to has the real contents on
+                // local disk, where a truncate is one syscall and costs no
+                // round trip. The server sees the result at the next flush.
+                let mut slot = file.staged.lock().await;
+                if slot.is_some() {
+                    let staged = slot.as_mut().expect("checked just above");
+                    staged.file.set_len(len).await.map_err(Error::Io)?;
+                    staged.len = len;
+                    staged.dirty = true;
+                    return Ok(());
+                }
             }
         }
         let current = self.stat_path(path).await?.size;

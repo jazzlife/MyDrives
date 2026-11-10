@@ -164,6 +164,56 @@ async fn reading_from_an_offset_restarts_the_transfer_there() {
     s.backend.close(f).await.expect("close");
 }
 
+/// The bug that running a real mount found: the mount layers do not write in
+/// order. A 1 MiB copy arrived as eight 128 KiB writes with the last four
+/// shuffled, and a backend that answered each one with `REST` + `STOR` left the
+/// file correct up to the first gap and zero-filled after it - a silent
+/// corruption that every test writing sequentially missed.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_that_arrive_out_of_order_still_make_the_right_file() {
+    let s = server().await;
+    let path = RPath::new("/shuffled.bin");
+    const CHUNK: usize = 128 * 1024;
+    let data: Vec<u8> = (0..8 * CHUNK).map(|i| (i % 251) as u8).collect();
+
+    let f = s.backend.create(&path).await.expect("create");
+    // The order a copy over NFS actually produced, tail first.
+    for chunk in [0usize, 1, 2, 6, 5, 4, 3, 7] {
+        let at = chunk * CHUNK;
+        let n = s
+            .backend
+            .write_at(f, at as u64, &data[at..at + CHUNK])
+            .await
+            .expect("write");
+        assert_eq!(n as usize, CHUNK);
+    }
+    s.backend.close(f).await.expect("close");
+
+    let back = read_all(&s.backend, &path).await;
+    assert_eq!(back.len(), data.len(), "the file is the wrong length");
+    assert!(back == data, "the bytes on the server are not the ones written");
+}
+
+/// Writing into the middle of a file must keep the rest of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_in_the_middle_leaves_the_rest_alone() {
+    let s = server().await;
+    let path = RPath::new("/patch.txt");
+    write_file(&s.backend, &path, b"0123456789").await;
+
+    let f = s
+        .backend
+        .open(&path, OpenOpts::read_write())
+        .await
+        .expect("open");
+    s.backend.write_at(f, 4, b"ab").await.expect("write");
+    // The same handle has to read back what it just wrote.
+    assert_eq!(s.backend.read_at(f, 0, 10).await.expect("read"), b"0123ab6789");
+    s.backend.close(f).await.expect("close");
+
+    assert_eq!(read_all(&s.backend, &path).await, b"0123ab6789");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn directories_list_what_is_in_them() {
     let s = server().await;
