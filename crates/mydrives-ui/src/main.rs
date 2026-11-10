@@ -29,6 +29,54 @@ const REFRESH: Duration = Duration::from_millis(1500);
 const SIDEBAR_WIDTH: f32 = 236.0;
 const ROW_HEIGHT: f32 = 48.0;
 
+/// 이미 떠 있는 설정 창이 자기 존재를 알리는 파일. 1초마다 갱신되므로
+/// 창이 죽으면 금방 낡은 것으로 판정됩니다.
+const LOCK_NAME: &str = "ui.lock";
+/// 새로 실행된 설정 창이 "네가 앞으로 나와라"라고 남기는 표시.
+const RAISE_NAME: &str = "ui.raise";
+const HEARTBEAT: Duration = Duration::from_secs(1);
+const STALE_AFTER: Duration = Duration::from_secs(5);
+
+fn lock_path() -> std::path::PathBuf {
+    mydrives_core::config::config_dir().join(LOCK_NAME)
+}
+
+fn raise_path() -> std::path::PathBuf {
+    mydrives_core::config::config_dir().join(RAISE_NAME)
+}
+
+/// 설정 창의 주인이 되거나, 이미 있는 창을 앞으로 불러내고 물러납니다.
+///
+/// 트레이의 "드라이브 관리..."도, 드라이브가 하나도 없을 때 에이전트가 여는
+/// 첫 화면도, 매번 이 프로그램을 새로 실행합니다. 그대로 두면 창이 열릴 때마다
+/// **쓰고 있던 창이 포커스를 빼앗기고** 입력하던 내용은 뒤에 남은 창에 갇힙니다.
+/// 그래서 창은 언제나 하나만 두고, 두 번째 실행은 그 창을 앞으로 올린 뒤 끝냅니다.
+fn claim_the_window() -> bool {
+    let claimed = claim_the_window_in(&mydrives_core::config::config_dir());
+    if !claimed {
+        tracing::info!("설정 창이 이미 열려 있어 그 창을 앞으로 올립니다");
+    }
+    claimed
+}
+
+/// 살아 있는 창이 있으면 `ui.raise`를 남기고 `false`, 없으면 자리를 차지하고 `true`.
+///
+/// 살아 있는지는 `ui.lock`이 최근에 갱신되었는지로 봅니다 - 창은 1초마다 그
+/// 파일을 다시 씁니다. 창이 죽으면 갱신이 멈추므로 다음 실행이 자리를 넘겨받고,
+/// 지우지 못한 잠금 파일 때문에 창이 영영 안 열리는 일이 없습니다.
+fn claim_the_window_in(dir: &std::path::Path) -> bool {
+    let lock = dir.join(LOCK_NAME);
+    if let Ok(modified) = std::fs::metadata(&lock).and_then(|m| m.modified()) {
+        if modified.elapsed().map(|e| e < STALE_AFTER).unwrap_or(false) {
+            let _ = std::fs::write(dir.join(RAISE_NAME), std::process::id().to_string());
+            return false;
+        }
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(&lock, std::process::id().to_string());
+    true
+}
+
 fn main() -> eframe::Result {
     // 트레이에서 띄우면(또는 디버그 빌드면) Windows가 이 프로세스에 콘솔 창을
     // 하나 붙여 줍니다. 창 옆에 검은 콘솔이 같이 뜨는 게 그것이라, 우리가
@@ -43,6 +91,10 @@ fn main() -> eframe::Result {
             .with_writer(std::sync::Mutex::new(file))
             .init(),
         None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+    }
+
+    if !claim_the_window() {
+        return Ok(());
     }
 
     let options = eframe::NativeOptions {
@@ -142,6 +194,8 @@ struct App {
     name_edit_for: Option<String>,
     sized: bool,
     dark: Option<bool>,
+    /// 창이 살아 있다는 표시를 마지막으로 갱신한 시각.
+    last_beat: Instant,
 }
 
 /// 폼이 만들 드라이브의 종류.
@@ -391,6 +445,7 @@ impl App {
             name_edit_for: None,
             sized: false,
             dark: None,
+            last_beat: Instant::now(),
         }
     }
 
@@ -525,6 +580,20 @@ impl App {
 impl eframe::App for App {
     /// 상태 갱신은 UI 밖에서. eframe이 매 프레임 `ui()` 전에 불러 줍니다.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 창이 살아 있다는 표시를 갱신하고, 두 번째 실행이 남긴 "앞으로 나와라"
+        // 요청을 받아 이 창을 올립니다. 새 창을 띄우는 대신 이 창을 쓰므로,
+        // 입력하던 내용과 키보드 포커스가 그대로 유지됩니다.
+        if self.last_beat.elapsed() >= HEARTBEAT {
+            self.last_beat = Instant::now();
+            let _ = std::fs::write(lock_path(), std::process::id().to_string());
+        }
+        let raise = raise_path();
+        if raise.exists() {
+            let _ = std::fs::remove_file(&raise);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+
         self.poll();
         // 작업 결과와 상태 변화를 바로 반영하기 위한 가벼운 주기 갱신.
         ctx.request_repaint_after(Duration::from_millis(300));
@@ -1516,6 +1585,34 @@ mod tests {
         form.drive = "Z:".into();
         form.mountpoint = "/Users/x/MyDrives/files".into();
         assert!(form.validate().is_ok());
+    }
+
+    #[test]
+    fn only_one_settings_window_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("mydrives-ui-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 아무도 없으면 자리를 차지합니다.
+        assert!(claim_the_window_in(&dir));
+        assert!(dir.join(LOCK_NAME).exists());
+        assert!(!dir.join(RAISE_NAME).exists());
+
+        // 살아 있는 창이 있으면 물러나면서 "앞으로 나와라"만 남깁니다.
+        assert!(!claim_the_window_in(&dir));
+        assert!(dir.join(RAISE_NAME).exists());
+
+        // 창이 죽어 표시가 낡으면 다음 실행이 자리를 넘겨받습니다 — 지워지지
+        // 못한 잠금 파일 하나로 설정 창이 영영 안 열리면 안 됩니다.
+        let stale = std::time::SystemTime::now() - STALE_AFTER - Duration::from_secs(1);
+        let lock = std::fs::File::options()
+            .write(true)
+            .open(dir.join(LOCK_NAME))
+            .expect("잠금 파일");
+        lock.set_modified(stale).expect("시각 되돌리기");
+        drop(lock);
+        assert!(claim_the_window_in(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
