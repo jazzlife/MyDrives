@@ -311,7 +311,15 @@ impl<T: Transport> Pool<T> {
         } else {
             &self.target.password
         };
-        stream.login(user, password).await.map_err(map_ftp_error)?;
+        // A refused login names the account, so "wrong password" cannot be
+        // confused with "cannot reach the server".
+        stream
+            .login(user, password)
+            .await
+            .map_err(|e| match map_ftp_error(e) {
+                Error::AuthFailed(m) => Error::AuthFailed(format!("'{user}' 로그인 거부 — {m}")),
+                other => other,
+            })?;
         // Everything is bytes: ASCII mode rewrites line endings mid-transfer,
         // which corrupts every file that is not text and breaks every size.
         stream

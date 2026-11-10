@@ -27,19 +27,66 @@ pub trait Transport: TokioTlsStream + Sized + Send + Sync + 'static {
 
 /// Plain TCP connect with a deadline: the server may accept and then never
 /// greet, which `connect` alone would wait out forever.
+///
+/// The address is resolved here, before dialling, so that a failure can say
+/// *what was actually dialled*. "Operation timed out" on its own leaves the
+/// user guessing whether the name resolved, which address was tried and how
+/// long it waited - all of which decide whether the next thing to check is the
+/// address, the port forwarding or the server.
 async fn connect_tcp<T>(target: &FtpTarget) -> FtpResult<ImplAsyncFtpStream<T>>
 where
     T: TokioTlsStream + Send + Sync + 'static,
 {
     let addr = format!("{}:{}", target.host, target.port);
-    tokio::time::timeout(CONNECT_TIMEOUT, ImplAsyncFtpStream::<T>::connect(addr))
+    let started = std::time::Instant::now();
+
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr)
         .await
-        .map_err(|_| {
+        .map_err(|e| {
             FtpError::ConnectionError(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("{}:{} 연결이 시간 내에 응답하지 않았습니다", target.host, target.port),
+                e.kind(),
+                format!("'{}' 주소를 찾지 못했습니다: {e}", target.host),
             ))
         })?
+        .collect();
+    let dialled = resolved
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if resolved.is_empty() {
+        return Err(FtpError::ConnectionError(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("'{}' 주소가 비어 있습니다", target.host),
+        )));
+    }
+    tracing::debug!(%addr, %dialled, "FTP 제어 연결 시도");
+
+    let attempt =
+        tokio::time::timeout(CONNECT_TIMEOUT, ImplAsyncFtpStream::<T>::connect(addr.clone()));
+    let outcome = match attempt.await {
+        Ok(result) => result,
+        Err(_) => {
+            return Err(FtpError::ConnectionError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "{} ({dialled}) 가 {}초 안에 응답하지 않았습니다",
+                    addr,
+                    CONNECT_TIMEOUT.as_secs()
+                ),
+            )))
+        }
+    };
+    outcome.map_err(|e| match e {
+        FtpError::ConnectionError(io) => FtpError::ConnectionError(std::io::Error::new(
+            io.kind(),
+            format!(
+                "{addr} ({dialled}) 에 연결하지 못했습니다 — {io} ({:.1}초 만에)",
+                started.elapsed().as_secs_f32()
+            ),
+        )),
+        other => other,
+    })
 }
 
 impl Transport for AsyncNoTlsStream {

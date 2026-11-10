@@ -388,6 +388,23 @@ async fn wait_for_shutdown(ipc: Option<Arc<tokio::sync::Notify>>) {
     tracing::info!("shutting down; unmounting everything");
 }
 
+/// Puts a password the user just typed into a throwaway config.
+///
+/// "Test" and "list shares" run against settings that have not been saved yet,
+/// so there is nothing in the keychain to read: the secret has to travel with
+/// the request. Every backend that takes a password needs an arm here - the
+/// first version of this only had SMB, which made "연결 테스트" on a new FTP
+/// drive log in with an empty password and report the server's rejection as if
+/// the settings were wrong.
+fn inline_secret(backend: &mut mydrives_core::config::BackendConfig, secret: String) {
+    use mydrives_core::config::BackendConfig;
+    match backend {
+        BackendConfig::Smb(smb) => smb.secret = SecretRef::Inline { value: secret },
+        BackendConfig::Ftp(ftp) => ftp.secret = SecretRef::Inline { value: secret },
+        BackendConfig::Mem(_) => {}
+    }
+}
+
 async fn handle(
     req: Request,
     manager: Arc<MountManager>,
@@ -476,9 +493,7 @@ async fn handle(
             // test never touches the keychain or the config file.
             let mut probe = remote.clone();
             if let Some(s) = secret {
-                if let mydrives_core::config::BackendConfig::Smb(smb) = &mut probe.backend {
-                    smb.secret = SecretRef::Inline { value: s };
-                }
+                inline_secret(&mut probe.backend, s);
             }
             let factory = factory::Factory;
             let result = async {
@@ -520,9 +535,7 @@ async fn handle(
         Request::ListShares { remote, secret } => {
             let mut probe = remote.clone();
             if let Some(s) = secret {
-                if let mydrives_core::config::BackendConfig::Smb(smb) = &mut probe.backend {
-                    smb.secret = SecretRef::Inline { value: s };
-                }
+                inline_secret(&mut probe.backend, s);
             }
             let result = (|| -> Result<Arc<mydrives_backend_smb::SmbBackend>, String> {
                 match &probe.backend {
