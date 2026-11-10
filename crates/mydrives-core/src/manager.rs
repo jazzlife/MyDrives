@@ -608,6 +608,19 @@ fn describe_config(cfg: &RemoteConfig) -> String {
         crate::config::BackendConfig::Smb(s) => {
             format!("smb://{}:{}/{}", s.host, s.port, s.share)
         }
+        crate::config::BackendConfig::Ftp(f) => {
+            let scheme = if f.security.eq_ignore_ascii_case("plain") {
+                "ftp"
+            } else {
+                "ftps"
+            };
+            format!(
+                "{scheme}://{}:{}{}",
+                f.host,
+                f.port,
+                f.subpath.as_deref().unwrap_or("")
+            )
+        }
         crate::config::BackendConfig::Mem(_) => "mem://".to_string(),
     }
 }

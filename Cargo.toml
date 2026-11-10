@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/mydrives-core",
   "crates/mydrives-backend-smb",
+  "crates/mydrives-backend-ftp",
   "crates/mydrives-ipc",
   "crates/mydrives-mount-fuse",
   "crates/mydrives-mount-nfs",
@@ -27,6 +28,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 mydrives-core = { path = "crates/mydrives-core" }
 mydrives-backend-smb = { path = "crates/mydrives-backend-smb" }
+mydrives-backend-ftp = { path = "crates/mydrives-backend-ftp" }
 mydrives-ipc = { path = "crates/mydrives-ipc" }
 mydrives-mount-fuse = { path = "crates/mydrives-mount-fuse" }
 mydrives-mount-nfs = { path = "crates/mydrives-mount-nfs" }

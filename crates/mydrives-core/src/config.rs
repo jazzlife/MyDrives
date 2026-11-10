@@ -149,10 +149,11 @@ impl RemoteConfig {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BackendConfig {
     Smb(SmbConfig),
+    Ftp(FtpConfig),
     Mem(MemConfig),
     // Planned, deliberately not stubbed as half-working backends:
-    //   Webdav(WebdavConfig), Ftp(FtpConfig), Gdrive(OAuthConfig),
-    //   Onedrive(OAuthConfig), Dropbox(OAuthConfig)
+    //   Mybox(TokenConfig), Gdrive(OAuthConfig), Onedrive(OAuthConfig),
+    //   Dropbox(OAuthConfig), Webdav(WebdavConfig)
     // Tracked for the second phase; see README.
 }
 
@@ -160,6 +161,7 @@ impl BackendConfig {
     pub fn kind(&self) -> &'static str {
         match self {
             BackendConfig::Smb(_) => "smb",
+            BackendConfig::Ftp(_) => "ftp",
             BackendConfig::Mem(_) => "mem",
         }
     }
@@ -183,6 +185,57 @@ pub struct SmbConfig {
 
 fn default_smb_port() -> u16 {
     445
+}
+
+/// FTP and FTPS. `security` is spelled out rather than inferred from the port,
+/// because a server may offer explicit FTPS on the plain port 21 - which is the
+/// usual arrangement - and nothing in the address says so.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FtpConfig {
+    pub host: String,
+    #[serde(default = "default_ftp_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub user: String,
+    /// Subdirectory of the account to expose as the mount root.
+    #[serde(default)]
+    pub subpath: Option<String>,
+    /// `plain`, `explicit` (AUTH TLS, the default) or `implicit`.
+    #[serde(default = "default_ftp_security")]
+    pub security: String,
+    /// Accept a TLS certificate that does not verify - what a NAS with its
+    /// factory self-signed certificate needs.
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
+    #[serde(default = "default_ftp_connections")]
+    pub max_connections: usize,
+    /// Where the password comes from. Default: the OS keychain.
+    #[serde(default)]
+    pub secret: SecretRef,
+}
+
+fn default_ftp_port() -> u16 {
+    21
+}
+
+fn default_ftp_security() -> String {
+    "explicit".to_string()
+}
+
+fn default_ftp_connections() -> usize {
+    4
+}
+
+impl FtpConfig {
+    /// The spellings `security` accepts. Checked where a drive is added, so a
+    /// typo is a message at that moment instead of a mount that fails later.
+    pub const SECURITY_VALUES: [&'static str; 3] = ["plain", "explicit", "implicit"];
+
+    pub fn security_is_known(value: &str) -> bool {
+        Self::SECURITY_VALUES
+            .iter()
+            .any(|v| value.eq_ignore_ascii_case(v))
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

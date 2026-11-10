@@ -13,6 +13,7 @@ use mydrives_core::error::{Error, Result};
 use mydrives_core::manager::BackendFactory;
 use mydrives_core::secret;
 
+use mydrives_backend_ftp::FtpTarget;
 use mydrives_backend_smb::{SmbBackend, SmbTarget};
 
 /// How long to wait for the OS credential store.
@@ -69,6 +70,29 @@ impl BackendFactory for Factory {
                         subpath: smb.subpath.clone(),
                     },
                 )))
+            }
+            BackendConfig::Ftp(ftp) => {
+                let password = load_secret(&cfg.id, &ftp.secret)?.unwrap_or_default();
+                let security = mydrives_backend_ftp::FtpSecurity::parse(&ftp.security)
+                    .ok_or_else(|| {
+                        Error::InvalidArgument(format!(
+                            "'{}'의 security 값 '{}'을 모르겠습니다 (plain, explicit, implicit)",
+                            cfg.id, ftp.security
+                        ))
+                    })?;
+                Ok(mydrives_backend_ftp::backend(
+                    cfg.id.clone(),
+                    FtpTarget {
+                        host: ftp.host.clone(),
+                        port: ftp.port,
+                        user: ftp.user.clone(),
+                        password,
+                        subpath: ftp.subpath.clone(),
+                        security,
+                        accept_invalid_certs: ftp.accept_invalid_certs,
+                        max_connections: ftp.max_connections,
+                    },
+                ))
             }
             BackendConfig::Mem(mem) => Ok(Arc::new(if mem.fixture {
                 fixture(&cfg.id)

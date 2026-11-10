@@ -7,7 +7,9 @@
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 
-use mydrives_core::config::{BackendConfig, MemConfig, RemoteConfig, SecretRef, SmbConfig};
+use mydrives_core::config::{
+    BackendConfig, FtpConfig, MemConfig, RemoteConfig, SecretRef, SmbConfig,
+};
 use mydrives_core::manager::MountState;
 use mydrives_ipc::{Request, Response};
 
@@ -113,6 +115,51 @@ enum AddKind {
         #[arg(long)]
         password_stdin: bool,
         /// Only part of the share.
+        #[arg(long)]
+        subpath: Option<String>,
+        /// Windows drive letter, e.g. `Z:`.
+        #[arg(long)]
+        drive: Option<String>,
+        /// Directory to mount on (macOS/Linux).
+        #[arg(long)]
+        mountpoint: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        readonly: bool,
+        #[arg(long)]
+        no_automount: bool,
+        /// Mount it right away.
+        #[arg(long)]
+        mount: bool,
+    },
+    /// An FTP or FTPS account (web host, router, older NAS).
+    Ftp {
+        /// Drive name. Defaults to the last part of the remote path, or to the
+        /// host when the whole account is mounted.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        host: String,
+        /// 21 for plain and explicit FTPS, 990 for implicit.
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long, default_value = "")]
+        user: String,
+        /// Read the password from stdin (recommended: it stays out of `ps` and
+        /// shell history). It is stored in the OS keychain, never in the config.
+        #[arg(long)]
+        password_stdin: bool,
+        /// `plain`, `explicit` (AUTH TLS, the default) or `implicit`.
+        #[arg(long, default_value = "explicit")]
+        security: String,
+        /// Accept a TLS certificate that does not verify - what a NAS with its
+        /// factory self-signed certificate needs.
+        #[arg(long)]
+        insecure_tls: bool,
+        /// Only part of the account, e.g. `/public_html`.
         #[arg(long)]
         subpath: Option<String>,
         /// Windows drive letter, e.g. `Z:`.
@@ -458,6 +505,70 @@ fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<String>, 
                         share,
                         user,
                         subpath,
+                        secret: SecretRef::Keychain,
+                    }),
+                    id,
+                },
+                secret,
+                mount,
+            ))
+        }
+        AddKind::Ftp {
+            id,
+            label,
+            host,
+            port,
+            user,
+            password_stdin,
+            security,
+            insecure_tls,
+            subpath,
+            drive,
+            mountpoint,
+            provider,
+            readonly,
+            no_automount,
+            mount,
+        } => {
+            let secret = if password_stdin {
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_line(&mut buf)
+                    .context("reading the password from stdin")?;
+                Some(buf.trim_end_matches(['\n', '\r']).to_string())
+            } else {
+                None
+            };
+            // Checked here so a typo is a message now rather than a failed mount
+            // later, when the agent builds the backend.
+            if !FtpConfig::security_is_known(&security) {
+                anyhow::bail!("--security 는 plain, explicit, implicit 중 하나여야 합니다");
+            }
+            // Implicit FTPS has its own well-known port; everything else is 21.
+            let port = port.unwrap_or(if security.eq_ignore_ascii_case("implicit") {
+                990
+            } else {
+                21
+            });
+            // The drive is named after the folder it exposes, like a share.
+            let id = id.unwrap_or_else(|| mydrives_core::naming::ftp_default_id(&host, subpath.as_deref()));
+            Ok((
+                RemoteConfig {
+                    // 비우면 에이전트가 제품 이름(호스트 이름)으로 채웁니다.
+                    label: label.unwrap_or_default(),
+                    automount: !no_automount,
+                    readonly,
+                    provider,
+                    drive,
+                    mountpoint,
+                    backend: BackendConfig::Ftp(FtpConfig {
+                        host,
+                        port,
+                        user,
+                        subpath,
+                        security,
+                        accept_invalid_certs: insecure_tls,
+                        max_connections: 4,
                         secret: SecretRef::Keychain,
                     }),
                     id,

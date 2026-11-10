@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, CornerRadius, FontId, Margin, RichText, Sense, Stroke, Vec2};
 
-use mydrives_core::config::{BackendConfig, RemoteConfig, SecretRef, SmbConfig};
+use mydrives_core::config::{BackendConfig, FtpConfig, RemoteConfig, SecretRef, SmbConfig};
 use mydrives_core::manager::{MountState, RemoteStatus};
 use mydrives_core::update::{UpdateState, UpdateStatus};
 use mydrives_ipc::{Request, Response, UpdateAction};
@@ -144,8 +144,36 @@ struct App {
     dark: Option<bool>,
 }
 
-/// 추가 폼. 심플 버전은 SMB(NAS)만 받습니다.
+/// 폼이 만들 드라이브의 종류.
+///
+/// 한 폼에 둘을 담는 것은, 사용자가 채우는 칸이 거의 같기 때문입니다 - 주소,
+/// 계정, 비밀번호, 어디에 붙일지. 다른 것은 "무엇을 고르느냐"(SMB는 공유 폴더,
+/// FTP는 계정 안의 경로)와 FTP의 TLS 선택뿐입니다.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DriveKind {
+    Smb,
+    Ftp,
+}
+
+impl DriveKind {
+    fn label(self) -> &'static str {
+        match self {
+            DriveKind::Smb => "NAS (SMB)",
+            DriveKind::Ftp => "FTP",
+        }
+    }
+
+    fn blurb(self) -> &'static str {
+        match self {
+            DriveKind::Smb => "QNAP·Synology 등 NAS의 공유 폴더를 드라이브로 연결합니다",
+            DriveKind::Ftp => "웹호스팅·공유기·구형 NAS의 FTP 계정을 드라이브로 연결합니다",
+        }
+    }
+}
+
+/// 추가 폼. SMB(NAS)와 FTP를 받습니다.
 struct Form {
+    kind: DriveKind,
     /// 드라이브 이름. 기본값은 **공유 폴더 이름**입니다 — 원격 폴더와 로컬 폴더
     /// 이름이 어긋나면 공유가 여러 개일 때 어느 것이 어느 것인지 알 수 없습니다.
     id: String,
@@ -167,6 +195,12 @@ struct Form {
     readonly: bool,
     automount: bool,
     advanced: bool,
+    /// FTP: `plain`, `explicit` 또는 `implicit`.
+    security: String,
+    /// FTP: 검증되지 않는 인증서를 받아들입니다(NAS 자체 서명).
+    insecure_tls: bool,
+    /// 포트를 직접 고쳤는지. 그렇지 않으면 종류와 보안 설정을 따라갑니다.
+    port_edited: bool,
 }
 
 impl Default for Form {
@@ -175,6 +209,7 @@ impl Default for Form {
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_default();
         Form {
+            kind: DriveKind::Smb,
             id: String::new(),
             id_edited: false,
             mountpoint_edited: false,
@@ -192,6 +227,9 @@ impl Default for Form {
             readonly: false,
             automount: true,
             advanced: false,
+            security: "explicit".into(),
+            insecure_tls: false,
+            port_edited: false,
         }
     }
 }
@@ -203,9 +241,21 @@ impl Form {
     /// 공유 폴더 이름을 따릅니다 — 이름은 "어느 장비인가"를, 경로는 "어느
     /// 폴더인가"를 말해야 하기 때문입니다.
     fn follow_sources(&mut self, taken: &[String]) {
-        let share = self.share.trim().to_string();
+        // SMB는 공유 폴더가, FTP는 계정 안의 경로가 "어느 폴더인가"에 해당합니다.
+        let share = match self.kind {
+            DriveKind::Smb => self.share.trim().to_string(),
+            DriveKind::Ftp => self.subpath.trim().to_string(),
+        };
+        if !self.port_edited {
+            self.port = self.default_port().to_string();
+        }
         if !self.id_edited {
-            self.id = share.clone();
+            self.id = match self.kind {
+                DriveKind::Smb => share.clone(),
+                DriveKind::Ftp => {
+                    mydrives_core::naming::ftp_default_id(self.host.trim(), opt(&self.subpath).as_deref())
+                }
+            };
         }
         if !self.name_edited {
             let backend = self.to_remote().backend;
@@ -225,8 +275,18 @@ impl Form {
         }
     }
 
+    /// 종류와 보안 설정에 맞는 포트. 사용자가 포트를 고치면 쓰이지 않습니다.
+    fn default_port(&self) -> u16 {
+        match self.kind {
+            DriveKind::Smb => 445,
+            // 명시적 FTPS는 평문과 같은 21번에서 AUTH TLS로 올라갑니다.
+            DriveKind::Ftp if self.security == "implicit" => 990,
+            DriveKind::Ftp => 21,
+        }
+    }
+
     fn validate(&self) -> Result<(), &'static str> {
-        if self.share.trim().is_empty() {
+        if self.kind == DriveKind::Smb && self.share.trim().is_empty() {
             return Err("공유 폴더 이름을 입력하세요");
         }
         if self.id.trim().is_empty() {
@@ -258,15 +318,27 @@ impl Form {
             provider: None,
             drive: opt(&self.drive),
             mountpoint: opt(&self.mountpoint),
-            backend: BackendConfig::Smb(SmbConfig {
-                host: self.host.trim().to_string(),
-                port: self.port.trim().parse().unwrap_or(445),
-                share: self.share.trim().to_string(),
-                user: self.user.trim().to_string(),
-                subpath: opt(&self.subpath),
-                // 저장은 에이전트가 OS 키체인에 합니다.
-                secret: SecretRef::Keychain,
-            }),
+            backend: match self.kind {
+                DriveKind::Smb => BackendConfig::Smb(SmbConfig {
+                    host: self.host.trim().to_string(),
+                    port: self.port.trim().parse().unwrap_or(445),
+                    share: self.share.trim().to_string(),
+                    user: self.user.trim().to_string(),
+                    subpath: opt(&self.subpath),
+                    // 저장은 에이전트가 OS 키체인에 합니다.
+                    secret: SecretRef::Keychain,
+                }),
+                DriveKind::Ftp => BackendConfig::Ftp(FtpConfig {
+                    host: self.host.trim().to_string(),
+                    port: self.port.trim().parse().unwrap_or(21),
+                    user: self.user.trim().to_string(),
+                    subpath: opt(&self.subpath),
+                    security: self.security.clone(),
+                    accept_invalid_certs: self.insecure_tls,
+                    max_connections: 4,
+                    secret: SecretRef::Keychain,
+                }),
+            },
         }
     }
 }
@@ -802,14 +874,26 @@ impl App {
     fn draw_form(&mut self, ui: &mut egui::Ui, p: &Palette, mut form: Form) -> Option<Form> {
         ui.label(RichText::new("새 드라이브").size(20.0).strong().color(p.text));
         ui.add_space(2.0);
-        ui.label(
-            RichText::new("QNAP·Synology 등 NAS의 공유 폴더를 드라이브로 연결합니다")
-                .color(p.dim),
-        );
-        ui.add_space(16.0);
+        ui.label(RichText::new(form.kind.blurb()).color(p.dim));
+        ui.add_space(12.0);
 
         let mut keep = true;
         let mut source_changed = false;
+
+        // 종류를 먼저 고릅니다: 아래 칸들이 여기에 따라 달라집니다.
+        ui.horizontal(|ui| {
+            for kind in [DriveKind::Smb, DriveKind::Ftp] {
+                if ui
+                    .selectable_label(form.kind == kind, RichText::new(kind.label()))
+                    .clicked()
+                    && form.kind != kind
+                {
+                    form.kind = kind;
+                    source_changed = true;
+                }
+            }
+        });
+        ui.add_space(10.0);
         // 이름이 이미 쓰이고 있는지 보려면 지금 있는 드라이브들의 이름이 필요합니다.
         let taken: Vec<String> = self
             .remotes
@@ -831,14 +915,44 @@ impl App {
                         );
                         source_changed |= r.changed();
                     });
-                    field(ui, p, "공유 폴더", |ui| {
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut form.share)
-                                .hint_text("예: Public")
-                                .desired_width(260.0),
-                        );
-                        source_changed |= r.changed();
-                    });
+                    match form.kind {
+                        DriveKind::Smb => field(ui, p, "공유 폴더", |ui| {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut form.share)
+                                    .hint_text("예: Public")
+                                    .desired_width(260.0),
+                            );
+                            source_changed |= r.changed();
+                        }),
+                        // FTP에는 공유라는 개념이 없습니다. 계정 전체를 쓰거나,
+                        // 그 안의 한 폴더만 드라이브로 띄웁니다.
+                        DriveKind::Ftp => field(ui, p, "폴더", |ui| {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut form.subpath)
+                                    .hint_text("계정 전체를 쓰려면 비워 둠 (예: /public_html)")
+                                    .desired_width(260.0),
+                            );
+                            source_changed |= r.changed();
+                        }),
+                    }
+                    if form.kind == DriveKind::Ftp {
+                        field(ui, p, "보안", |ui| {
+                            for (value, label) in [
+                                ("explicit", "FTPS (권장)"),
+                                ("implicit", "FTPS (암묵적)"),
+                                ("plain", "일반 FTP"),
+                            ] {
+                                if ui
+                                    .selectable_label(form.security == value, label)
+                                    .clicked()
+                                    && form.security != value
+                                {
+                                    form.security = value.to_string();
+                                    source_changed = true;
+                                }
+                            }
+                        });
+                    }
                     field(ui, p, "이름", |ui| {
                         let r = ui.add(
                             egui::TextEdit::singleline(&mut form.name)
@@ -920,21 +1034,34 @@ impl App {
                             }
                         });
                         field(ui, p, "포트", |ui| {
-                            ui.add(
+                            let r = ui.add(
                                 egui::TextEdit::singleline(&mut form.port).desired_width(90.0),
                             );
+                            if r.changed() {
+                                form.port_edited = true;
+                            }
                         });
-                        field(ui, p, "하위 경로", |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut form.subpath)
-                                    .hint_text("공유 폴더 전체를 쓰려면 비워 둠")
-                                    .desired_width(260.0),
-                            );
-                        });
+                        // FTP는 이 경로를 기본 칸에서 이미 받았습니다.
+                        if form.kind == DriveKind::Smb {
+                            field(ui, p, "하위 경로", |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.subpath)
+                                        .hint_text("공유 폴더 전체를 쓰려면 비워 둠")
+                                        .desired_width(260.0),
+                                );
+                            });
+                        }
                         field(ui, p, "옵션", |ui| {
                             ui.checkbox(&mut form.automount, "시작할 때 자동 연결");
                             ui.add_space(10.0);
                             ui.checkbox(&mut form.readonly, "읽기 전용");
+                            if form.kind == DriveKind::Ftp && form.security != "plain" {
+                                ui.add_space(10.0);
+                                ui.checkbox(
+                                    &mut form.insecure_tls,
+                                    "인증서를 검증하지 않음 (NAS 자체 서명)",
+                                );
+                            }
                         });
                     });
             });
@@ -1260,6 +1387,38 @@ mod tests {
         form.follow_sources(&[]);
         assert_eq!(form.id, "nas");
         assert_eq!(form.name, "거북이");
+    }
+
+    #[test]
+    fn an_ftp_drive_is_named_after_the_folder_it_exposes() {
+        let mut form = Form {
+            home: "/Users/x".into(),
+            kind: DriveKind::Ftp,
+            ..Form::default()
+        };
+        form.host = "files.example.com".into();
+        form.subpath = "/public_html".into();
+        form.follow_sources(&[]);
+
+        assert_eq!(form.id, "public_html");
+        assert_eq!(form.name, "files");
+        // 명시적 FTPS는 평문과 같은 포트에서 시작합니다.
+        assert_eq!(form.port, "21");
+
+        // 계정 전체를 쓰면 이름 삼을 폴더가 없으므로 호스트를 따릅니다.
+        form.subpath.clear();
+        form.follow_sources(&[]);
+        assert_eq!(form.id, "files");
+
+        // 암묵적 FTPS만 포트가 다릅니다.
+        form.security = "implicit".into();
+        form.follow_sources(&[]);
+        assert_eq!(form.port, "990");
+
+        // 공유 폴더는 FTP에 없는 개념이라 검사하지 않습니다.
+        form.drive = "Z:".into();
+        form.mountpoint = "/Users/x/MyDrives/files".into();
+        assert!(form.validate().is_ok());
     }
 
     #[test]

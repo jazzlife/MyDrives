@@ -1,0 +1,43 @@
+[package]
+name = "mydrives-backend-ftp"
+description = "FTP / FTPS backend for MyDrives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mydrives-core.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "time", "sync"] }
+tracing.workspace = true
+
+# Pure-Rust FTP/FTPS client with the pieces a filesystem needs: MLSD for
+# machine-readable listings, REST for reading and resuming at an offset, and a
+# transfer stream that can be driven byte by byte.
+suppaftp = { version = "12", default-features = false, features = [
+  "tokio",
+  "tokio-rustls-ring",
+  # Implicit FTPS (port 990) lives behind this flag - "deprecated" is about the
+  # protocol mode, not the crate API, and NAS boxes still offer it.
+  "deprecated",
+] }
+# The same TLS stack the rest of the agent uses, so no second crypto library
+# ends up in the binary.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# MDTM hands back a `chrono` date; the version has to be the one suppaftp uses.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# An FTP server in the test process, so the protocol is exercised for real
+# without anything to install on the machine running `cargo test`.
+# `default-features = false` keeps the test build on ring: libunftp defaults to
+# rustls' aws-lc-rs backend, which drags a C toolchain (cmake, and NASM on
+# Windows) into `cargo test` for the whole workspace.
+libunftp = { version = "0.24", default-features = false, features = ["ring"] }
+unftp-sbe-fs = "0.4"
+tempfile = "3"

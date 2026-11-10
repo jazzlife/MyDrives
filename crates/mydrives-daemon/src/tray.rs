@@ -572,6 +572,7 @@ mod tests {
     }
 
     /// WCAG relative luminance, which is what a contrast ratio is built from.
+    #[cfg(not(target_os = "macos"))]
     fn luminance(c: &[u8]) -> f64 {
         let channel = |v: u8| {
             let s = v as f64 / 255.0;
@@ -584,6 +585,7 @@ mod tests {
         0.2126 * channel(c[0]) + 0.7152 * channel(c[1]) + 0.0722 * channel(c[2])
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn contrast(a: &[u8], b: &[u8]) -> f64 {
         let (x, y) = (luminance(a), luminance(b));
         let (hi, lo) = if x > y { (x, y) } else { (y, x) };

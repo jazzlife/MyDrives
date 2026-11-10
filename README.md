@@ -17,7 +17,7 @@ Rust 코어 하나에 OS별 마운트 어댑터를 붙이는 구조입니다. �
                    Vfs  ── inode·핸들·메타데이터 캐시·읽기 청크
                     │
                     ▼
-                 Backend  (SMB ✅ | FTP* | WebDAV* | Google Drive* | OneDrive* | Dropbox*)
+                 Backend  (SMB ✅ | FTP ✅ | MYBOX* | Google Drive* | OneDrive* | Dropbox*)
                                                                     * 2차 구현 예정
 ```
 
@@ -36,7 +36,8 @@ Rust 코어 하나에 OS별 마운트 어댑터를 붙이는 구조입니다. �
 | 자격증명 — Keychain / Credential Manager | ✅ 최초 1회 입력, 이후 다시 묻지 않음 |
 | 로그인 시 자동 시작 (LaunchAgent / `Run` 키) | ✅ 양 OS 검증 |
 | 끊김 감지 + 자동 재연결 워치독 | ✅ |
-| FTP·WebDAV·클라우드 드라이브 | ⏳ 2차 구현 |
+| **FTP / FTPS 백엔드** — MLSD·REST 기반, 3 OS 공용 | ✅ FTP 서버 대상 통합 테스트 |
+| WebDAV·네이버 MYBOX·Google Drive·OneDrive·Dropbox | ⏳ 2차 구현 |
 
 설계 근거와 라이선스 판단: [docs/DECISIONS.md](docs/DECISIONS.md)
 (검증 결과 전문·내부 구조·로드맵 문서는 아직 작성 전입니다.)
@@ -71,7 +72,7 @@ Rust 코어 하나에 OS별 마운트 어댑터를 붙이는 구조입니다. �
 ```bash
 cargo build --release                     # 에이전트 + CLI (헤드리스)
 cargo build --release --features tray     # 트레이/메뉴바 포함 (데스크탑 배포용)
-cargo test --workspace --features tray    # 단위·통합 테스트 (macOS 82 · FUSE-T 빌드 86 / Windows 76)
+cargo test --workspace --features tray    # 단위·통합 테스트 (macOS 108; FTP 통합 테스트는 서버를 테스트 안에서 띄움)
 ```
 
 요구사항
@@ -105,6 +106,13 @@ mydrivesd run --no-tray        # 헤드리스
 echo 'mypassword' | mydrives add smb \
   --id nas --host 192.168.0.10 --share data --user admin \
   --drive Z: --mountpoint ~/MyDrives/nas --password-stdin --mount
+
+# 2-1) FTP·FTPS 등록 — 보안 기본값은 explicit(연결 후 AUTH TLS, 포트 21)
+echo 'mypassword' | mydrives add ftp \
+  --host files.example.com --user myid --subpath /public_html \
+  --drive F: --password-stdin --mount
+# 자체 서명 인증서를 쓰는 NAS면 --insecure-tls, 평문 FTP면 --security plain,
+# 암묵적 FTPS(990)면 --security implicit
 
 # 3) 상태 확인 / 마운트 제어
 mydrives status

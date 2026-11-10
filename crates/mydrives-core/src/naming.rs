@@ -17,9 +17,12 @@ use crate::config::BackendConfig;
 pub fn product_name(backend: &BackendConfig) -> String {
     match backend {
         BackendConfig::Smb(smb) => nas_name(&smb.host),
+        // An FTP account is on a host, not on a product: the server has no name
+        // of its own to offer, so the address is the best there is.
+        BackendConfig::Ftp(ftp) => nas_name(&ftp.host),
         BackendConfig::Mem(_) => "테스트 볼륨".to_string(),
         // Planned backends name themselves after the service, not the folder:
-        //   Ftp(_)      => host_name(&ftp.host) or "FTP"
+        //   Mybox(_)    => "네이버 MYBOX"
         //   Gdrive(_)   => "Google Drive"
         //   Onedrive(_) => "OneDrive"
         //   Dropbox(_)  => "Dropbox"
@@ -41,6 +44,31 @@ fn nas_name(host: &str) -> String {
     match host.split('.').next() {
         Some(first) if !first.is_empty() => first.to_string(),
         _ => "NAS".to_string(),
+    }
+}
+
+/// What an FTP drive is called when the user does not say.
+///
+/// The rule is the one the SMB drives follow - the id is the remote folder, so
+/// `~/MyDrives/<id>` matches what is on the server. An FTP account mounted
+/// whole has no folder to be named after, so it falls back to the host.
+pub fn ftp_default_id(host: &str, subpath: Option<&str>) -> String {
+    let leaf = subpath
+        .unwrap_or("")
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !leaf.is_empty() {
+        return leaf;
+    }
+    let host = nas_name(host);
+    if host == "NAS" {
+        "FTP".to_string()
+    } else {
+        host
     }
 }
 
@@ -80,6 +108,9 @@ pub fn is_generated_label(label: &str, backend: &BackendConfig) -> bool {
         BackendConfig::Smb(smb) => {
             label == format!("{}/{}", smb.host, smb.share) || label == smb.share
         }
+        // FTP drives have had product names from the start, so the only older
+        // shape to recognise is the bare host the first version wrote.
+        BackendConfig::Ftp(ftp) => label == ftp.host,
         BackendConfig::Mem(_) => label == "in-memory test volume",
     }
 }
