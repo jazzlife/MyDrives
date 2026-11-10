@@ -51,6 +51,11 @@ const DIR_HANDLE_BIT: u64 = 1 << 63;
 #[cfg(all(target_os = "macos", feature = "macfuse"))]
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How long to let Bonjour notice that a drive's name is free again before
+/// reporting the disconnect as done. See [`end_fuse_t_helper`].
+#[cfg(all(target_os = "macos", feature = "macfuse"))]
+const NAME_RELEASE_GRACE: Duration = Duration::from_millis(1200);
+
 pub struct FuseProvider;
 
 impl FuseProvider {
@@ -290,21 +295,112 @@ impl MountSession for FuseMount {
 
     fn unmount(self: Box<Self>) -> Result<()> {
         let session = self.session.lock().take();
-        match session {
+        let result = match session {
             Some(s) => s.umount_and_join().map_err(|e| {
                 Error::Backend(format!("unmounting {} failed: {e}", self.path.display()))
             }),
             None => Ok(()),
-        }
+        };
+        end_fuse_t_helper(&self.path);
+        result
     }
+}
+
+/// Ends the FUSE-T helper that was serving a mount point.
+///
+/// FUSE-T does not serve the volume from this process: `libfuse-t` starts
+/// `/usr/local/bin/go-nfsv4` as a child of ours, which publishes the volume
+/// over Bonjour under the name in `--location` and speaks NFS to us. Unmounting
+/// ends our side of it, and the helper carries on running - still holding that
+/// Bonjour name.
+///
+/// The effect is cumulative and very visible: connect and disconnect a drive
+/// called "FTP" a few times and Finder shows FTP-1, FTP-2, FTP-5, FTP-6, each
+/// mount taking the next free number because the previous helpers never let go
+/// of theirs. Measured on one machine: two mounts, seven helpers.
+///
+/// Helpers are our own children and carry the mount point as their last
+/// argument, which is enough to find exactly the one that belongs to this mount
+/// and leave every other drive's alone.
+#[cfg_attr(not(all(target_os = "macos", feature = "macfuse")), allow(dead_code))]
+fn end_fuse_t_helper(mountpoint: &std::path::Path) {
+    #[cfg(all(target_os = "macos", feature = "macfuse"))]
+    {
+        if !fuse_t::is_installed() {
+            return;
+        }
+        let helpers = fuse_t_helpers(mountpoint);
+        for &pid in &helpers {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        if helpers.is_empty() {
+            return;
+        }
+        // The helper does not act on SIGTERM - measured: it was still running,
+        // and still advertising, three seconds later - so the polite signal is
+        // only a courtesy and SIGKILL is what actually ends it. The mount it
+        // served is already gone by this point, so nothing is lost with it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        for pid in helpers {
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            // They are our children: without reaping them they stay as zombies
+            // in every process listing for as long as the agent runs.
+            let mut status = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            tracing::info!(pid, mountpoint = %mountpoint.display(), "FUSE-T 헬퍼를 정리했습니다");
+        }
+        // Bonjour frees the drive's name a moment after the helper that
+        // registered it exits, not the instant it does. Reconnecting inside
+        // that window makes macOS hand out "<name>-2" to avoid clashing with a
+        // registration that is on its way out - and the drive then keeps the
+        // number. Measured: a reconnect two seconds after disconnect took the
+        // suffix, one with a few seconds' gap did not. The wait is on the
+        // disconnect side, where a moment costs nothing.
+        std::thread::sleep(NAME_RELEASE_GRACE);
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macfuse")))]
+    let _ = mountpoint;
+}
+
+/// Pids of this process's `go-nfsv4` children serving `mountpoint`.
+#[cfg(all(target_os = "macos", feature = "macfuse"))]
+fn fuse_t_helpers(mountpoint: &std::path::Path) -> Vec<i32> {
+    let me = std::process::id().to_string();
+    let listing = std::process::Command::new("/bin/ps")
+        .args(["-o", "pid=,ppid=,args=", "-ax"])
+        .output();
+    let Ok(listing) = listing else {
+        return Vec::new();
+    };
+    let wanted = mountpoint.to_string_lossy();
+    String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid: i32 = parts.next()?.parse().ok()?;
+            let ppid = parts.next()?;
+            if ppid != me {
+                return None;
+            }
+            let args = line.split_once(ppid)?.1;
+            // The mount point is the helper's last argument; matching the whole
+            // word keeps `/MyDrives/x` from matching `/MyDrives/x-2`.
+            let last = args.split_whitespace().next_back()?;
+            (args.contains("go-nfsv4") && last == wanted).then_some(pid)
+        })
+        .collect()
 }
 
 impl Drop for FuseMount {
     fn drop(&mut self) {
-        // Backstop: a dropped session must not leave a dangling mount point.
+        // Backstop: a dropped session must not leave a dangling mount point -
+        // nor a helper still advertising the drive's name.
         if let Some(session) = self.session.lock().take() {
             tracing::warn!(mountpoint = %self.path.display(), "FUSE mount dropped without unmount()");
             drop(session);
+            end_fuse_t_helper(&self.path);
         }
     }
 }
