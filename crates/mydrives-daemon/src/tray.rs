@@ -473,13 +473,35 @@ fn open_in_file_manager(path: &str) {
 /// A small drive glyph, drawn in code so the agent needs no asset files (and no
 /// image decoder dependency).
 ///
-/// Drawn as an **outline** on purpose: macOS renders menu bar icons as template
-/// images, where only the alpha channel survives and every opaque pixel becomes
-/// one flat colour. A filled rectangle therefore shows up as a featureless white
-/// blob; the shape has to be carried by the transparent parts.
+/// Two renderings of the same mark, because the two platforms disagree about
+/// what a tray icon is:
+///
+/// * macOS treats a menu bar icon as a template image - only the alpha channel
+///   survives and every opaque pixel becomes one flat colour, which the system
+///   flips with light/dark mode. A filled rectangle would show up as a
+///   featureless blob, so there the shape is carried by an **outline** and the
+///   colour below is irrelevant.
+/// * Windows (and the Linux trays) draw the pixels as given, against a task bar
+///   that is near-white under the light theme and near-black under the dark one.
+///   A near-white outline is invisible on half of those, so there the mark is
+///   **filled with the brand accent** - the same blue as the app icon
+///   (`packaging/icon.py`) - which stands out on either background without the
+///   agent having to watch the system theme.
 fn drive_icon() -> Icon {
+    let (rgba, size) = drive_icon_rgba();
+    Icon::from_rgba(rgba, size, size).expect("the generated icon is valid RGBA")
+}
+
+/// The glyph's pixels, split out so a test can look at the colours it draws.
+fn drive_icon_rgba() -> (Vec<u8>, u32) {
     const SIZE: i32 = 32;
+    #[cfg(target_os = "macos")]
     const BORDER: i32 = 3;
+    // The template colour: on macOS only its alpha is kept.
+    const GLYPH: [u8; 4] = [0xEA, 0xEA, 0xEA, 0xFF];
+    #[cfg(not(target_os = "macos"))]
+    const ACCENT: [u8; 4] = [0x00, 0x7A, 0xFF, 0xFF];
+    const CLEAR: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
     let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
 
     // Body: 24 x 16, centred.
@@ -500,29 +522,43 @@ fn drive_icon() -> Icon {
     for y in 0..SIZE {
         for x in 0..SIZE {
             let outer = in_rounded(x, y, left, top, w, h, radius);
-            let inner = in_rounded(
-                x,
-                y,
-                left + BORDER,
-                top + BORDER,
-                w - 2 * BORDER,
-                h - 2 * BORDER,
-                (radius - BORDER).max(1),
-            );
             // Activity light: a filled dot inside, on the right.
             let (ldx, ldy) = (x - (left + w - 7), y - (top + h / 2));
             let led = ldx * ldx + ldy * ldy <= 4;
 
-            let opaque = (outer && !inner) || led;
+            // Outline: only the border of the body is drawn, its interior stays
+            // clear, and the light sits in that hole.
+            #[cfg(target_os = "macos")]
+            let pixel = {
+                let inner = in_rounded(
+                    x,
+                    y,
+                    left + BORDER,
+                    top + BORDER,
+                    w - 2 * BORDER,
+                    h - 2 * BORDER,
+                    (radius - BORDER).max(1),
+                );
+                if (outer && !inner) || led {
+                    GLYPH
+                } else {
+                    CLEAR
+                }
+            };
+            // Filled: the whole body carries the accent and the light is punched
+            // out of it in white, so the mark still has an inside at 16 x 16.
+            #[cfg(not(target_os = "macos"))]
+            let pixel = match (outer, led) {
+                (true, true) => GLYPH,
+                (true, false) => ACCENT,
+                (false, _) => CLEAR,
+            };
+
             let i = ((y * SIZE + x) * 4) as usize;
-            rgba[i..i + 4].copy_from_slice(&if opaque {
-                [0xEA, 0xEA, 0xEA, 0xFF]
-            } else {
-                [0x00, 0x00, 0x00, 0x00]
-            });
+            rgba[i..i + 4].copy_from_slice(&pixel);
         }
     }
-    Icon::from_rgba(rgba, SIZE as u32, SIZE as u32).expect("the generated icon is valid RGBA")
+    (rgba, SIZE as u32)
 }
 
 #[cfg(test)]
@@ -533,6 +569,57 @@ mod tests {
     fn icon_is_valid() {
         // from_rgba would have panicked on a wrong buffer length.
         let _ = drive_icon();
+    }
+
+    /// WCAG relative luminance, which is what a contrast ratio is built from.
+    fn luminance(c: &[u8]) -> f64 {
+        let channel = |v: u8| {
+            let s = v as f64 / 255.0;
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(c[0]) + 0.7152 * channel(c[1]) + 0.0722 * channel(c[2])
+    }
+
+    fn contrast(a: &[u8], b: &[u8]) -> f64 {
+        let (x, y) = (luminance(a), luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// Windows and the Linux trays draw the icon's own colours, so the mark has
+    /// to survive both task bar themes. It used to be near-white, which made it
+    /// all but invisible under the Windows light theme.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn the_mark_stands_out_on_a_light_and_a_dark_task_bar() {
+        const LIGHT_TASK_BAR: [u8; 3] = [0xF3, 0xF3, 0xF3];
+        const DARK_TASK_BAR: [u8; 3] = [0x20, 0x20, 0x20];
+
+        let (rgba, _) = drive_icon_rgba();
+        // The body is the colour most of the opaque pixels are: the activity
+        // light is a handful of pixels inside it.
+        let mut body: Option<&[u8]> = None;
+        let mut best = 0;
+        let opaque: Vec<&[u8]> = rgba.chunks_exact(4).filter(|p| p[3] == 0xFF).collect();
+        for candidate in &opaque {
+            let count = opaque.iter().filter(|p| p[..3] == candidate[..3]).count();
+            if count > best {
+                (best, body) = (count, Some(*candidate));
+            }
+        }
+        let body = body.expect("the glyph has opaque pixels");
+
+        for background in [LIGHT_TASK_BAR, DARK_TASK_BAR] {
+            let ratio = contrast(&body[..3], &background);
+            assert!(
+                ratio >= 3.0,
+                "the mark {body:02X?} has only {ratio:.1}:1 against {background:02X?}"
+            );
+        }
     }
 
     #[test]
