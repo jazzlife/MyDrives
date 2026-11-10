@@ -186,7 +186,7 @@ pub async fn call(req: &Request) -> IpcResult<Response> {
 pub async fn serve<H, F>(handler: H) -> IpcResult<()>
 where
     H: Fn(Request) -> F + Send + Sync + 'static,
-    F: std::future::Future<Output = (Response, bool)> + Send,
+    F: std::future::Future<Output = (Response, bool)> + Send + 'static,
 {
     let handler = std::sync::Arc::new(handler);
 
@@ -215,12 +215,26 @@ where
         }
         tracing::info!(endpoint = %path.display(), "control socket ready");
 
+        // Each connection is handled on its own task. A single request can
+        // block for seconds - unmounting a busy FUSE-T volume waits on the
+        // kernel - and handling connections inline would freeze every other
+        // request behind it (a `status` call could not answer while one drive
+        // was disconnecting). `shutdown` is a request like any other, so the
+        // task that sees it signals the accept loop to stop.
+        let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
         loop {
-            let (stream, _) = listener.accept().await?;
-            let handler = handler.clone();
-            let stop = handle_conn(stream, handler).await;
-            if stop {
-                break;
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted?;
+                    let handler = handler.clone();
+                    let stop_tx = stop_tx.clone();
+                    tokio::spawn(async move {
+                        if handle_conn(stream, handler).await {
+                            let _ = stop_tx.send(()).await;
+                        }
+                    });
+                }
+                _ = stop_rx.recv() => break,
             }
         }
         let _ = std::fs::remove_file(&path);

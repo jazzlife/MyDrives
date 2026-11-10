@@ -372,7 +372,17 @@ impl MountManager {
         }
         let mut result = Ok(());
         if let Some(session) = session {
-            result = session.unmount();
+            // The unmount is a blocking syscall - on macOS it force-unmounts an
+            // smbfs volume, which the kernel can take seconds over - so it runs
+            // on a blocking thread, off the async workers. Otherwise one slow
+            // disconnect would hold a runtime thread and, with few of them, stall
+            // other work. `spawn_blocking` only fails if the runtime is shutting
+            // down, in which case the unmount still ran.
+            result = tokio::task::spawn_blocking(move || session.unmount())
+                .await
+                .unwrap_or_else(|e| {
+                    Err(Error::Backend(format!("the unmount task did not finish: {e}")))
+                });
         }
         if let Some(vfs) = vfs {
             if let Err(e) = vfs.backend().disconnect().await {

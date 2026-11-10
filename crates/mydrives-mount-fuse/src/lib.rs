@@ -305,15 +305,70 @@ impl MountSession for FuseMount {
     }
 
     fn unmount(self: Box<Self>) -> Result<()> {
+        // A FUSE-T mount is smbfs served by a loopback helper. fuser's plain
+        // unmount(2) blocks in the kernel whenever the volume is busy - a
+        // Finder window on it, Spotlight indexing, a `._` write - and if the
+        // helper then stops while it waits, the mount wedges with no server
+        // and nothing but `umount -f` clears it (measured: a disconnect left
+        // the whole agent stuck in uninterruptible wait). So force it first:
+        // the kernel tears the mount down even while busy, and the caller has
+        // already flushed and released open files before reaching here.
+        let forced = force_unmount_fuse_t(&self.path);
+        // With the volume gone, the helper is ended *before* the session is
+        // joined. fuser's join waits for its reader thread to see the channel
+        // close, and on FUSE-T that channel is the socket to the helper: while
+        // the helper lives the read never returns and the join hangs. Ending
+        // it first closes the socket, so the thread exits and the join
+        // returns at once. (On the unforced path - macFUSE, Linux - the mount
+        // is gone the normal way and the helper, if any, is ended after.)
+        if forced {
+            end_fuse_t_helper(&self.path);
+        }
         let session = self.session.lock().take();
         let result = match session {
-            Some(s) => s.umount_and_join().map_err(|e| {
-                Error::Backend(format!("unmounting {} failed: {e}", self.path.display()))
-            }),
+            Some(s) => match s.umount_and_join() {
+                Ok(()) => Ok(()),
+                // The forced unmount already cleared it, so fuser then finding
+                // nothing mounted is the expected outcome, not a failure.
+                Err(_) if forced => Ok(()),
+                Err(e) => Err(Error::Backend(format!(
+                    "unmounting {} failed: {e}",
+                    self.path.display()
+                ))),
+            },
             None => Ok(()),
         };
-        end_fuse_t_helper(&self.path);
+        if !forced {
+            end_fuse_t_helper(&self.path);
+        }
         result
+    }
+}
+
+/// Force-unmounts a FUSE-T volume, returning true when it did the unmount.
+///
+/// `MNT_FORCE` is what lets the kernel drop an smbfs mount that is busy or has
+/// lost its server, where the ordinary unmount blocks indefinitely. Only used
+/// for FUSE-T, and only on macOS; everywhere else the gentle unmount is right.
+/// A later "not mounted" from fuser is then expected, so the caller is told
+/// this ran.
+#[cfg_attr(not(all(target_os = "macos", feature = "macfuse")), allow(dead_code))]
+fn force_unmount_fuse_t(path: &std::path::Path) -> bool {
+    #[cfg(all(target_os = "macos", feature = "macfuse"))]
+    {
+        if !fuse_t::is_installed() {
+            return false;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) == 0 }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macfuse")))]
+    {
+        let _ = path;
+        false
     }
 }
 
