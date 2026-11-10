@@ -41,11 +41,15 @@ const SESSION_THREADS: usize = 4;
 /// Marks a directory handle, keeping it out of the VFS's file handle numbers.
 /// See `opendir`.
 const DIR_HANDLE_BIT: u64 = 1 << 63;
-/// How long FUSE-T's helper gets to put the volume on the mount point. It
-/// takes a second or two on a healthy Mac; the limit is only there so a broken
-/// install fails with a message instead of hanging.
+/// How long FUSE-T's helper gets to put the volume on the mount point.
+///
+/// A second or two, once macOS has been told the app may look for devices on
+/// the local network. Until that is answered - and it is asked the first time
+/// a newly installed app mounts - the Bonjour lookup FUSE-T does sits for
+/// about half a minute, so the limit has to be generously past that or the
+/// first mount after an install reports a failure that then mounts anyway.
 #[cfg(all(target_os = "macos", feature = "macfuse"))]
-const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
+const MOUNT_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct FuseProvider;
 
@@ -212,7 +216,9 @@ impl MountProvider for FuseProvider {
         if fuse_t::is_installed() && !wait_until_mounted(&path, MOUNT_TIMEOUT) {
             let _ = session.umount_and_join();
             return Err(Error::Backend(format!(
-                "FUSE-T did not finish mounting {} within {} s",
+                "FUSE-T did not finish mounting {} within {} s. If macOS asked \
+                 whether MyDrives may find devices on the local network, the \
+                 mount is waiting for that answer",
                 path.display(),
                 MOUNT_TIMEOUT.as_secs()
             )));
