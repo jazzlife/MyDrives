@@ -1090,6 +1090,21 @@ impl App {
                             source_changed |= r.changed();
                         }),
                     }
+                    // 포트는 어느 종류든 기본 칸에 둡니다. NAS는 공유 포트를
+                    // 바꿔 쓰는 일이 흔한데, 이 칸이 "고급 설정" 뒤에 숨어 있으면
+                    // 주소 칸에 `host:5445`처럼 적는 수밖에 없습니다.
+                    if form.kind == DriveKind::Smb {
+                        field(ui, p, "포트", |ui| {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut form.port).desired_width(90.0),
+                            );
+                            if r.changed() {
+                                form.port_edited = true;
+                            }
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("기본 445").color(p.dim));
+                        });
+                    }
                     if form.kind == DriveKind::Ftp {
                         field(ui, p, "보안", |ui| {
                             for (value, label) in [
@@ -1253,16 +1268,10 @@ impl App {
                                 form.id_edited = !form.id.trim().is_empty();
                             }
                         });
-                        // FTP는 포트와 하위 경로를 기본 칸에서 이미 받았습니다.
+                        // 포트는 두 종류 모두 기본 칸에 있습니다. 여기서는
+                        // 공유 폴더 안의 하위 경로만 받습니다(FTP는 그 칸을
+                        // "폴더"로 이미 받았습니다).
                         if form.kind == DriveKind::Smb {
-                            field(ui, p, "포트", |ui| {
-                                let r = ui.add(
-                                    egui::TextEdit::singleline(&mut form.port).desired_width(90.0),
-                                );
-                                if r.changed() {
-                                    form.port_edited = true;
-                                }
-                            });
                             field(ui, p, "하위 경로", |ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut form.subpath)
