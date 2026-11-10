@@ -3,3 +3,8 @@
 .aidev/
 *.tmp
 config.local.toml
+
+# Packaging output (disk image, setup program, icon scaffolding).
+/dist
+/pkg
+/build
