@@ -25,6 +25,8 @@ keyring = { version = "3", default-features = false, features = ["windows-native
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
+# Finder's sidebar list files are NSKeyedArchiver plists; see `finder.rs`.
+plist = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

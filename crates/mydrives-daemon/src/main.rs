@@ -336,6 +336,18 @@ fn run_agent(
         if config.lock().remotes.is_empty() {
             tray::open_settings_window_args(&["--add"]);
         }
+        // launchd stops the agent with SIGTERM - `launchctl bootout`, logging
+        // out, an update replacing it. The event loop below never hears a
+        // signal, so without this the agent sat until launchd killed it, with
+        // its mounts still up and its FUSE-T helpers left running; the next
+        // start then found its own ghosts holding the drives' names. Measured.
+        {
+            let shutdown = shutdown.clone();
+            runtime.spawn(async move {
+                wait_for_shutdown(None).await;
+                shutdown.notify_one();
+            });
+        }
         // The tray owns the main thread: both AppKit and the Win32 message pump
         // require their event loop to run there.
         let r = tray::run(
@@ -487,6 +499,16 @@ async fn handle(
                 );
             }
             let id = remote.id.clone();
+            // A drive moved to another folder gets a new sidebar row when it
+            // mounts; the old one would otherwise stay, pointing nowhere.
+            if let Some(previous) = manager.config_of(&id) {
+                let before = manager.mount_path_of(&previous);
+                if before != manager.mount_path_of(&remote) {
+                    if let Err(e) = mydrives_core::finder::unpin_volume(&before) {
+                        tracing::warn!(remote = %id, "could not take the old folder out of Finder's sidebar: {e}");
+                    }
+                }
+            }
             if let Some(s) = s {
                 if let Err(e) = secret::store(&id, &s) {
                     return (
@@ -597,6 +619,7 @@ async fn handle(
             }
         }
         Request::Remove { id } => {
+            let pinned = manager.config_of(&id).map(|cfg| manager.mount_path_of(&cfg));
             if let Err(e) = manager.forget(&id) {
                 return (
                     Response::Error {
@@ -604,6 +627,13 @@ async fn handle(
                     },
                     false,
                 );
+            }
+            // The sidebar row was made for this drive; a drive that is gone
+            // must not leave a dead row behind.
+            if let Some(path) = pinned {
+                if let Err(e) = mydrives_core::finder::unpin_volume(&path) {
+                    tracing::warn!(remote = %id, "could not take the drive out of Finder's sidebar: {e}");
+                }
             }
             let _ = secret::delete(&id);
             let saved = {

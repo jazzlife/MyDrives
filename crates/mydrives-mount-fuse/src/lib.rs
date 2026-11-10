@@ -206,6 +206,14 @@ impl MountProvider for FuseProvider {
             locks: Locks::default(),
         };
 
+        // Whatever is still serving this mount point from an agent that died
+        // has to go first, or the new helper takes a numbered name and the
+        // mount connects to the ghost.
+        #[cfg(all(target_os = "macos", feature = "macfuse"))]
+        if fuse_t::is_installed() {
+            end_stray_fuse_t_helpers(&path);
+        }
+
         let session = fuser::spawn_mount(fs, &path, &config).map_err(|e| {
             Error::Backend(format!("FUSE mount of {} failed: {e}", path.display()))
         })?;
@@ -220,6 +228,9 @@ impl MountProvider for FuseProvider {
         #[cfg(all(target_os = "macos", feature = "macfuse"))]
         if fuse_t::is_installed() && !wait_until_mounted(&path, MOUNT_TIMEOUT) {
             let _ = session.umount_and_join();
+            // The helper of a mount that never landed keeps the drive's name
+            // just like one whose mount ended; the retry needs it gone.
+            end_fuse_t_helper(&path);
             return Err(Error::Backend(format!(
                 "FUSE-T did not finish mounting {} within {} s. If macOS asked \
                  whether MyDrives may find devices on the local network, the \
@@ -329,7 +340,7 @@ fn end_fuse_t_helper(mountpoint: &std::path::Path) {
         if !fuse_t::is_installed() {
             return;
         }
-        let helpers = fuse_t_helpers(mountpoint);
+        let helpers = fuse_t_helpers(mountpoint, false);
         for &pid in &helpers {
             unsafe { libc::kill(pid, libc::SIGTERM) };
         }
@@ -364,9 +375,36 @@ fn end_fuse_t_helper(mountpoint: &std::path::Path) {
     let _ = mountpoint;
 }
 
-/// Pids of this process's `go-nfsv4` children serving `mountpoint`.
+/// Ends helpers serving `mountpoint` that no agent owns any more.
+///
+/// An agent that is killed rather than stopped - launchd's grace period
+/// running out, a crash, a developer's kill - leaves its helpers running under
+/// launchd, each still advertising the drive's name and still holding the port
+/// the kernel's SMB client connected to. The next mount of the same drive then
+/// registers as "<name>-1", and `mount_smbfs` resolves the *old* name to the
+/// dead helper and fails or hangs - measured three times in one evening. So
+/// before a mount, whatever still serves that mount point is ended, whoever
+/// started it. Nothing is lost: an unowned helper has no session behind it.
 #[cfg(all(target_os = "macos", feature = "macfuse"))]
-fn fuse_t_helpers(mountpoint: &std::path::Path) -> Vec<i32> {
+fn end_stray_fuse_t_helpers(mountpoint: &std::path::Path) {
+    let strays = fuse_t_helpers(mountpoint, true);
+    if strays.is_empty() {
+        return;
+    }
+    for &pid in &strays {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        // Reaps it if it happens to be ours; harmless otherwise.
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        tracing::warn!(pid, mountpoint = %mountpoint.display(), "주인 없는 FUSE-T 헬퍼를 정리했습니다");
+    }
+    std::thread::sleep(NAME_RELEASE_GRACE);
+}
+
+/// Pids of the `go-nfsv4` helpers serving `mountpoint` - this process's own
+/// children, or with `any_parent` every process's.
+#[cfg(all(target_os = "macos", feature = "macfuse"))]
+fn fuse_t_helpers(mountpoint: &std::path::Path, any_parent: bool) -> Vec<i32> {
     let me = std::process::id().to_string();
     let listing = std::process::Command::new("/bin/ps")
         .args(["-o", "pid=,ppid=,args=", "-ax"])
@@ -381,7 +419,7 @@ fn fuse_t_helpers(mountpoint: &std::path::Path) -> Vec<i32> {
             let mut parts = line.split_whitespace();
             let pid: i32 = parts.next()?.parse().ok()?;
             let ppid = parts.next()?;
-            if ppid != me {
+            if !any_parent && ppid != me {
                 return None;
             }
             let args = line.split_once(ppid)?.1;

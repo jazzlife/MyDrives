@@ -225,11 +225,15 @@ impl MountManager {
                 "drive letters only apply to Windows; using a directory mount"
             );
         }
-        let path = match &cfg.mountpoint {
+        Ok(MountTarget::Path(self.mount_path_of(cfg)))
+    }
+
+    /// The directory a drive mounts on, whether the config names one or not.
+    pub fn mount_path_of(&self, cfg: &RemoteConfig) -> std::path::PathBuf {
+        match &cfg.mountpoint {
             Some(p) => expand_tilde(p),
             None => self.mount_root.join(&cfg.id),
-        };
-        Ok(MountTarget::Path(path))
+        }
     }
 
     pub async fn mount(self: &Arc<Self>, id: &str) -> Result<String> {
@@ -261,6 +265,7 @@ impl MountManager {
                 }
                 self.spawn_watchdog(id, &mountpoint);
                 tracing::info!(remote = id, mountpoint = %mountpoint, provider, "mounted");
+                pin_to_sidebar(id, &mountpoint);
                 Ok(mountpoint)
             }
             Err(e) => {
@@ -571,6 +576,27 @@ fn create_mount_point(path: &std::path::Path, sudo_mount: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Put a freshly mounted drive in Finder's sidebar, off the mount's path.
+///
+/// Finder's own row for the drive is the SMB server FUSE-T presents, which
+/// opens a list of shares rather than the files; a pinned volume opens the
+/// files. Done after every successful mount because it is idempotent and
+/// cheap when the drive is already there, and the first time it has to
+/// happen while the volume is mounted or Finder files it as a folder. A
+/// failure is logged, never fatal: the drive works without the row.
+fn pin_to_sidebar(id: &str, mountpoint: &str) {
+    if !cfg!(target_os = "macos") || mountpoint.is_empty() {
+        return;
+    }
+    let id = id.to_string();
+    let path = std::path::PathBuf::from(mountpoint);
+    tokio::task::spawn_blocking(move || match crate::finder::pin_volume(&path) {
+        Ok(true) => tracing::info!(remote = %id, path = %path.display(), "pinned to Finder's sidebar"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(remote = %id, "could not pin to Finder's sidebar: {e}"),
+    });
 }
 
 /// Removes an empty mount point, with the same privilege rules as creating it.

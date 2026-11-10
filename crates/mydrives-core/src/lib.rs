@@ -27,6 +27,7 @@ pub mod cache;
 pub mod config;
 pub mod console;
 pub mod error;
+pub mod finder;
 pub mod fuse_t;
 pub mod inode;
 pub mod manager;

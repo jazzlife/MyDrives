@@ -351,11 +351,18 @@ impl Form {
             );
         }
         if !self.mountpoint_edited && !cfg!(windows) {
-            // 공유 이름을 받기 전에는 비워 둡니다. ".../MyDrives/drive" 같은
-            // 자리표시 경로가 들어가 있으면 진짜 값처럼 보입니다.
-            self.mountpoint = match self.id.trim() {
-                "" => String::new(),
-                name => format!("{}/MyDrives/{name}", self.home),
+            // 폴더는 드라이브의 **이름**을 따릅니다. Finder 사이드바와 "컴퓨터"
+            // 보기가 폴더 이름을 그대로 보여 주므로, 사용자가 읽는 이름은
+            // 하나여야 합니다. 공유 이름을 받기 전에는 비워 둡니다 -
+            // ".../MyDrives/drive" 같은 자리표시 경로는 진짜 값처럼 보입니다.
+            let folder = if self.name.trim().is_empty() {
+                self.id.trim()
+            } else {
+                self.name.trim()
+            };
+            self.mountpoint = match (self.id.trim(), folder) {
+                ("", _) | (_, "") => String::new(),
+                (_, folder) => format!("{}/MyDrives/{}", self.home, folder.replace('/', "-")),
             };
         }
     }
@@ -953,8 +960,18 @@ impl App {
                     );
                 }
             });
-            info_row(ui, p, "드라이브 이름", &r.id);
             info_row(ui, p, "종류", kind_label(&r.kind));
+            // 사이드바 행과 "컴퓨터" 보기는 마운트 폴더의 이름을 씁니다. 그 이름이
+            // 위의 이름과 다르면 사용자는 어느 것이 드라이브인지 알 수 없으므로
+            // 여기서 보여 줍니다.
+            if cfg!(target_os = "macos") {
+                let shown = mountpoint
+                    .as_deref()
+                    .and_then(|m| m.trim_end_matches('/').rsplit('/').next())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&r.id);
+                info_row(ui, p, "Finder 표시", &format!("사이드바 '위치'에 '{shown}'"));
+            }
             info_row(ui, p, "상태", &state_detail(&r.state));
             info_row(
                 ui,
@@ -1645,16 +1662,20 @@ mod tests {
         form.share = "Public".into();
         form.follow_sources(&[], &[]);
 
-        // 경로는 공유 폴더를, 이름은 장비를 따릅니다.
+        // 드라이브 이름(id)은 공유 폴더를, 표시 이름과 폴더는 장비를 따릅니다.
+        // Finder가 보여 주는 것은 폴더 이름이므로 표시 이름과 같아야 합니다.
         assert_eq!(form.id, "Public");
         assert_eq!(form.name, "turtlelab");
         if !cfg!(windows) {
-            assert_eq!(form.mountpoint, "/Users/x/MyDrives/Public");
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/turtlelab");
         }
 
         // 같은 NAS의 두 번째 공유는 이름이 겹치지 않게 공유 이름이 붙습니다.
         form.follow_sources(&["turtlelab".to_string()], &[]);
         assert_eq!(form.name, "turtlelab (Public)");
+        if !cfg!(windows) {
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/turtlelab (Public)");
+        }
 
         // 사용자가 직접 고친 칸은 따라가지 않습니다.
         form.id = "nas".into();
@@ -1738,7 +1759,7 @@ mod tests {
         // 드라이브 이름과 마운트 경로에 슬래시가 섞이지 않습니다.
         assert_eq!(form.id, "jazzlife");
         if !cfg!(windows) {
-            assert_eq!(form.mountpoint, "/Users/x/MyDrives/jazzlife");
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/turtlelab");
         }
 
         match form.to_remote().backend {
@@ -1803,7 +1824,7 @@ mod tests {
         // 드라이브 이름과 마운트 폴더는 들어가는 폴더를 따릅니다.
         assert_eq!(form.id, "Study");
         if !cfg!(windows) {
-            assert_eq!(form.mountpoint, "/Users/x/MyDrives/Study");
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/turtlelab");
         }
         match form.to_remote().backend {
             BackendConfig::Smb(smb) => {
@@ -1859,7 +1880,7 @@ mod tests {
         form.follow_sources(&[], &["jazzlife".to_string()]);
         assert_eq!(form.id, "jazzlife-2");
         if !cfg!(windows) {
-            assert_eq!(form.mountpoint, "/Users/x/MyDrives/jazzlife-2");
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/turtlelab");
         }
 
         form.follow_sources(&[], &["jazzlife".to_string(), "jazzlife-2".to_string()]);
