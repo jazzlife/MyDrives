@@ -311,9 +311,16 @@ impl Form {
             self.port = port.to_string();
             self.port_edited = true;
         }
-        // SMB는 공유 폴더가, FTP는 계정 안의 경로가 "어느 폴더인가"에 해당합니다.
+        // "어느 폴더인가": SMB는 공유 폴더 칸(공유 안의 폴더까지 적었으면 그
+        // 마지막 폴더), FTP는 계정 안의 경로입니다.
         let share = match self.kind {
-            DriveKind::Smb => clean_share(&self.share),
+            DriveKind::Smb => {
+                let (share, inside) = split_share_path(&self.share);
+                inside
+                    .and_then(|p| p.rsplit('/').next().map(str::to_string))
+                    .filter(|leaf| !leaf.is_empty())
+                    .unwrap_or(share)
+            }
             DriveKind::Ftp => self.subpath.trim().to_string(),
         };
         if !self.port_edited {
@@ -409,15 +416,20 @@ impl Form {
             drive: opt(&self.drive),
             mountpoint: opt(&self.mountpoint),
             backend: match self.kind {
-                DriveKind::Smb => BackendConfig::Smb(SmbConfig {
-                    host: host.clone(),
-                    port: port.unwrap_or(445),
-                    share: clean_share(&self.share),
-                    user: self.user.trim().to_string(),
-                    subpath: clean_subpath(&self.subpath),
-                    // 저장은 에이전트가 OS 키체인에 합니다.
-                    secret: SecretRef::Keychain,
-                }),
+                DriveKind::Smb => {
+                    let (share, inside) = split_share_path(&self.share);
+                    BackendConfig::Smb(SmbConfig {
+                        host: host.clone(),
+                        port: port.unwrap_or(445),
+                        share,
+                        user: self.user.trim().to_string(),
+                        // 공유 폴더 칸에 폴더까지 적었으면 그것이, 아니면 고급
+                        // 설정의 하위 경로가 마운트의 맨 위가 됩니다.
+                        subpath: inside.or_else(|| clean_subpath(&self.subpath)),
+                        // 저장은 에이전트가 OS 키체인에 합니다.
+                        secret: SecretRef::Keychain,
+                    })
+                }
                 DriveKind::Ftp => BackendConfig::Ftp(FtpConfig {
                     host: host.clone(),
                     port: port.unwrap_or(21),
@@ -467,18 +479,29 @@ fn split_host_port(raw: &str) -> Option<(String, u16)> {
     Some((host.trim().to_string(), port))
 }
 
-/// 공유 이름에서 경로 구분자를 떼어 냅니다.
+/// 공유 폴더 칸에 적힌 것을 **공유 이름**과 **그 안의 경로**로 가릅니다.
 ///
-/// 사람은 공유를 `/jazzlife` 나 `\\nas\jazzlife` 처럼 경로로 적지만, SMB가
-/// 받는 것은 이름 하나입니다. 그대로 넘기면 `bad SMB target: Share name...`.
-fn clean_share(raw: &str) -> String {
-    raw.trim()
-        .trim_matches(['/', '\\'])
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string()
+/// 사람은 이 칸에 `Public`만 적기도, `/Public`이라 적기도, `Public/2026`이나
+/// `\\nas\Public\2026`처럼 들어가고 싶은 폴더까지 적기도 합니다. SMB가 받는
+/// 공유 이름은 첫 조각뿐이고, 나머지는 그 공유 안에서 보여줄 폴더입니다. 첫
+/// 조각 이외를 버리면 폴더를 적어도 공유의 맨 위가 뜨고, 마지막 조각만 남기면
+/// 있지도 않은 공유를 찾습니다 - 둘 다 실제로 겪은 일입니다.
+fn split_share_path(raw: &str) -> (String, Option<String>) {
+    let trimmed = raw.trim();
+    // `\\nas\Public\...`: UNC 경로의 첫 조각은 호스트입니다.
+    let unc = trimmed.starts_with("\\\\") || trimmed.starts_with("//");
+    let normalized = trimmed.replace('\\', "/");
+    let mut parts: Vec<&str> = normalized
+        .split('/')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if unc && !parts.is_empty() {
+        parts.remove(0);
+    }
+    let share = parts.first().map(|s| s.to_string()).unwrap_or_default();
+    let inside = (parts.len() > 1).then(|| format!("/{}", parts[1..].join("/")));
+    (share, inside)
 }
 
 /// 하위 경로는 항상 `/`로 시작하는 한 줄로 만듭니다.
@@ -1091,7 +1114,7 @@ impl App {
                         DriveKind::Smb => field(ui, p, "공유 폴더", |ui| {
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut form.share)
-                                    .hint_text("예: Public")
+                                    .hint_text("예: Public 또는 Public/2026 (안의 폴더까지)")
                                     .desired_width(260.0),
                             );
                             source_changed |= r.changed();
@@ -1739,11 +1762,23 @@ mod tests {
             Some(("192.168.0.10".to_string(), 445))
         );
 
-        // 공유 이름은 경로로 적어도 이름 하나로 추려집니다.
-        assert_eq!(clean_share("/jazzlife"), "jazzlife");
-        assert_eq!(clean_share("\\\\nas\\jazzlife"), "jazzlife");
-        assert_eq!(clean_share("  Public/  "), "Public");
-        assert_eq!(clean_share(""), "");
+        // 공유 폴더 칸: 첫 조각이 공유, 나머지가 그 안의 폴더입니다.
+        assert_eq!(split_share_path("/jazzlife"), ("jazzlife".into(), None));
+        assert_eq!(split_share_path("  Public/  "), ("Public".into(), None));
+        assert_eq!(split_share_path(""), (String::new(), None));
+        assert_eq!(
+            split_share_path("jazzlife/Study"),
+            ("jazzlife".into(), Some("/Study".into()))
+        );
+        assert_eq!(
+            split_share_path("/jazzlife/Study/2026"),
+            ("jazzlife".into(), Some("/Study/2026".into()))
+        );
+        // UNC 경로의 첫 조각은 호스트라 공유가 아닙니다.
+        assert_eq!(
+            split_share_path("\\\\nas\\jazzlife\\Study"),
+            ("jazzlife".into(), Some("/Study".into()))
+        );
 
         // 하위 경로는 항상 / 로 시작합니다.
         assert_eq!(clean_subpath("photos/2026"), Some("/photos/2026".into()));
@@ -1753,6 +1788,32 @@ mod tests {
 
     /// 이름 칸을 비우고 새로 적으려 하면, 비는 순간 호스트 이름으로 다시
     /// 채워져 적을 수가 없었습니다. 손댄 칸은 그대로 둬야 합니다.
+    /// 사용자가 겪은 일: 공유 폴더 칸에 `jazzlife/Study`라 적었는데 드라이브는
+    /// 공유의 맨 위를 보여줬습니다. 폴더까지 적었으면 그 폴더가 맨 위여야 합니다.
+    #[test]
+    fn a_folder_inside_the_share_becomes_the_top_of_the_drive() {
+        let mut form = Form {
+            home: "/Users/x".into(),
+            ..Form::default()
+        };
+        form.host = "turtlelab.ddns.net".into();
+        form.share = "jazzlife/Study".into();
+        form.follow_sources(&[], &[]);
+
+        // 드라이브 이름과 마운트 폴더는 들어가는 폴더를 따릅니다.
+        assert_eq!(form.id, "Study");
+        if !cfg!(windows) {
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/Study");
+        }
+        match form.to_remote().backend {
+            BackendConfig::Smb(smb) => {
+                assert_eq!(smb.share, "jazzlife");
+                assert_eq!(smb.subpath.as_deref(), Some("/Study"));
+            }
+            _ => panic!("SMB 백엔드여야 합니다"),
+        }
+    }
+
     #[test]
     fn a_field_the_user_cleared_stays_cleared() {
         let mut form = Form {
