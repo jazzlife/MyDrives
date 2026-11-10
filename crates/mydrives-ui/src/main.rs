@@ -197,6 +197,12 @@ struct Form {
     advanced: bool,
     /// FTP: `plain`, `explicit` 또는 `implicit`.
     security: String,
+    /// FTP: `passive`, `epsv` 또는 `active`.
+    mode: String,
+    /// FTP 패시브: PASV가 알려준 주소 대신 접속한 주소를 씁니다(NAT 뒤 서버).
+    nat_workaround: bool,
+    /// FTP 액티브: 서버가 되돌아 연결할 때까지 기다리는 시간(초).
+    active_timeout: String,
     /// FTP: 검증되지 않는 인증서를 받아들입니다(NAS 자체 서명).
     insecure_tls: bool,
     /// 포트를 직접 고쳤는지. 그렇지 않으면 종류와 보안 설정을 따라갑니다.
@@ -228,6 +234,9 @@ impl Default for Form {
             automount: true,
             advanced: false,
             security: "explicit".into(),
+            mode: "passive".into(),
+            nat_workaround: false,
+            active_timeout: "10".into(),
             insecure_tls: false,
             port_edited: false,
         }
@@ -334,6 +343,9 @@ impl Form {
                     user: self.user.trim().to_string(),
                     subpath: opt(&self.subpath),
                     security: self.security.clone(),
+                    mode: self.mode.clone(),
+                    passive_nat_workaround: self.nat_workaround,
+                    active_timeout_secs: self.active_timeout.trim().parse().unwrap_or(10),
                     accept_invalid_certs: self.insecure_tls,
                     max_connections: 4,
                     secret: SecretRef::Keychain,
@@ -910,7 +922,10 @@ impl App {
                     field(ui, p, "호스트", |ui| {
                         let r = ui.add(
                             egui::TextEdit::singleline(&mut form.host)
-                                .hint_text("192.168.0.10 또는 nas.example.com")
+                                .hint_text(match form.kind {
+                                    DriveKind::Smb => "192.168.0.10 또는 nas.example.com",
+                                    DriveKind::Ftp => "ftp.example.com 또는 192.168.0.10",
+                                })
                                 .desired_width(260.0),
                         );
                         source_changed |= r.changed();
@@ -952,6 +967,68 @@ impl App {
                                 }
                             }
                         });
+                        // 포트는 보안 설정을 따라 21/990으로 채워지지만, 호스팅마다
+                        // 다른 포트를 쓰는 일이 흔해 여기서 바로 고칠 수 있어야 합니다.
+                        field(ui, p, "포트", |ui| {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut form.port).desired_width(90.0),
+                            );
+                            if r.changed() {
+                                form.port_edited = true;
+                            }
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(match form.security.as_str() {
+                                    "implicit" => "기본 990",
+                                    _ => "기본 21",
+                                })
+                                .color(p.dim),
+                            );
+                        });
+                        // 데이터 연결 방식. 공유기 뒤에서는 패시브만 되고, 일부
+                        // 서버는 액티브만 받으므로 고르게 둡니다.
+                        field(ui, p, "데이터 연결", |ui| {
+                            for (value, label) in [
+                                ("passive", "패시브 (권장)"),
+                                ("epsv", "패시브 EPSV"),
+                                ("active", "액티브"),
+                            ] {
+                                if ui.selectable_label(form.mode == value, label).clicked()
+                                    && form.mode != value
+                                {
+                                    form.mode = value.to_string();
+                                }
+                            }
+                        });
+                        if form.mode == "active" {
+                            field(ui, p, "응답 대기", |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.active_timeout)
+                                        .desired_width(60.0),
+                                );
+                                ui.add_space(6.0);
+                                ui.label(RichText::new("초").color(p.dim));
+                            });
+                            // 액티브 모드가 쓰는 로컬 포트는 OS가 고릅니다. 범위를
+                            // 정하는 설정을 흉내 내는 대신 사실대로 적습니다.
+                            field(ui, p, "", |ui| {
+                                ui.label(
+                                    RichText::new(
+                                        "서버가 되돌아 연결할 포트는 OS가 고릅니다 — 이 컴퓨터 \
+                                         앞단 방화벽에서 임의 포트 수신이 열려 있어야 합니다",
+                                    )
+                                    .color(p.dim)
+                                    .size(11.0),
+                                );
+                            });
+                        } else {
+                            field(ui, p, "", |ui| {
+                                ui.checkbox(
+                                    &mut form.nat_workaround,
+                                    "서버가 알려준 주소 대신 접속한 주소 사용 (공유기 뒤 서버)",
+                                );
+                            });
+                        }
                     }
                     field(ui, p, "이름", |ui| {
                         let r = ui.add(
@@ -966,7 +1043,10 @@ impl App {
                     field(ui, p, "계정", |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut form.user)
-                                .hint_text("NAS 로그인 ID")
+                                .hint_text(match form.kind {
+                                    DriveKind::Smb => "NAS 로그인 ID",
+                                    DriveKind::Ftp => "FTP 로그인 ID (익명이면 anonymous)",
+                                })
                                 .desired_width(260.0),
                         );
                     });
@@ -1033,16 +1113,16 @@ impl App {
                                 form.id_edited = !form.id.trim().is_empty();
                             }
                         });
-                        field(ui, p, "포트", |ui| {
-                            let r = ui.add(
-                                egui::TextEdit::singleline(&mut form.port).desired_width(90.0),
-                            );
-                            if r.changed() {
-                                form.port_edited = true;
-                            }
-                        });
-                        // FTP는 이 경로를 기본 칸에서 이미 받았습니다.
+                        // FTP는 포트와 하위 경로를 기본 칸에서 이미 받았습니다.
                         if form.kind == DriveKind::Smb {
+                            field(ui, p, "포트", |ui| {
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(&mut form.port).desired_width(90.0),
+                                );
+                                if r.changed() {
+                                    form.port_edited = true;
+                                }
+                            });
                             field(ui, p, "하위 경로", |ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut form.subpath)
@@ -1414,6 +1494,23 @@ mod tests {
         form.security = "implicit".into();
         form.follow_sources(&[]);
         assert_eq!(form.port, "990");
+
+        // 포트를 직접 고치면 보안 설정이 바뀌어도 그 값을 지킵니다.
+        form.port = "2121".into();
+        form.port_edited = true;
+        form.security = "plain".into();
+        form.follow_sources(&[]);
+        assert_eq!(form.port, "2121");
+
+        // 데이터 연결은 패시브가 기본입니다.
+        assert_eq!(form.mode, "passive");
+        assert_eq!(
+            match form.to_remote().backend {
+                BackendConfig::Ftp(ftp) => (ftp.mode, ftp.port, ftp.active_timeout_secs),
+                _ => panic!("FTP 백엔드여야 합니다"),
+            },
+            ("passive".to_string(), 2121, 10)
+        );
 
         // 공유 폴더는 FTP에 없는 개념이라 검사하지 않습니다.
         form.drive = "Z:".into();

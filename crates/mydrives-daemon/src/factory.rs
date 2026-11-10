@@ -80,6 +80,12 @@ impl BackendFactory for Factory {
                             cfg.id, ftp.security
                         ))
                     })?;
+                let mode = mydrives_backend_ftp::FtpMode::parse(&ftp.mode).ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "'{}'의 mode 값 '{}'을 모르겠습니다 (passive, epsv, active)",
+                        cfg.id, ftp.mode
+                    ))
+                })?;
                 Ok(mydrives_backend_ftp::backend(
                     cfg.id.clone(),
                     FtpTarget {
@@ -89,6 +95,9 @@ impl BackendFactory for Factory {
                         password,
                         subpath: ftp.subpath.clone(),
                         security,
+                        mode,
+                        passive_nat_workaround: ftp.passive_nat_workaround,
+                        active_timeout: Duration::from_secs(ftp.active_timeout_secs.max(1)),
                         accept_invalid_certs: ftp.accept_invalid_certs,
                         max_connections: ftp.max_connections,
                     },

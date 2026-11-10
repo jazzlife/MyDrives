@@ -27,6 +27,11 @@
 //! * **No exclusive create, no atomic replace.** `STOR` overwrites silently and
 //!   `RNFR`/`RNTO` fails if the target exists on most servers, so `create` and
 //!   `rename` check first. That is a race no FTP server offers a way to close.
+//! * **Passive or active.** Passive is the default and the only one that works
+//!   from behind a household router; active is there because some servers still
+//!   insist on it. The port the server connects back to in active mode is the
+//!   operating system's choice - the client library has no setting for a range -
+//!   so that mode needs the ephemeral range open on this machine.
 //! * **No `statfs`.** There is no command for free space, and reporting zero
 //!   makes Explorer and Finder refuse to copy anything. The mount reports a
 //!   nominal volume instead; see [`NOMINAL_VOLUME`].
@@ -46,7 +51,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use suppaftp::tokio::{AsyncNoTlsStream, AsyncRustlsStream, ImplAsyncFtpStream, TransferStream};
 use suppaftp::types::FileType;
-use suppaftp::{FtpError, Status};
+use suppaftp::{FtpError, Mode, Status};
 
 use mydrives_core::backend::{BFile, Backend};
 use mydrives_core::error::{Error, Result};
@@ -97,6 +102,41 @@ impl FtpSecurity {
     }
 }
 
+/// How the data connection is opened.
+///
+/// Passive is the default everywhere and the only one that works from behind a
+/// household router: the client dials out for every transfer. Active turns that
+/// around - the server connects back to a port the client is listening on -
+/// which some corporate servers insist on and which needs the client reachable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FtpMode {
+    #[default]
+    Passive,
+    /// `EPSV` instead of `PASV`: the same idea in the spelling RFC 2428 defined
+    /// for IPv6, which some servers accept only in that form.
+    ExtendedPassive,
+    Active,
+}
+
+impl FtpMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FtpMode::Passive => "passive",
+            FtpMode::ExtendedPassive => "epsv",
+            FtpMode::Active => "active",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "passive" | "pasv" => Some(FtpMode::Passive),
+            "epsv" | "extended-passive" | "extended_passive" => Some(FtpMode::ExtendedPassive),
+            "active" | "port" => Some(FtpMode::Active),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FtpTarget {
     pub host: String,
@@ -106,6 +146,19 @@ pub struct FtpTarget {
     /// Expose only this subdirectory of the account as the mount root.
     pub subpath: Option<String>,
     pub security: FtpSecurity,
+    pub mode: FtpMode,
+    /// Passive mode: use the address of the control connection rather than the
+    /// one `PASV` answered with. The fix for a server behind NAT that reports
+    /// its private address.
+    pub passive_nat_workaround: bool,
+    /// Active mode: how long to wait for the server to connect back.
+    ///
+    /// The port it connects back to is picked by the operating system. The
+    /// client library binds port 0 and has no setting for a range, so a
+    /// firewall in front of this machine has to allow the ephemeral range for
+    /// active mode to work at all - which is one more reason passive is the
+    /// default.
+    pub active_timeout: std::time::Duration,
     /// Accept a certificate that does not verify. Needed for the self-signed
     /// certificates NAS boxes ship with.
     pub accept_invalid_certs: bool,
@@ -123,6 +176,9 @@ impl Default for FtpTarget {
             password: String::new(),
             subpath: None,
             security: FtpSecurity::Explicit,
+            mode: FtpMode::Passive,
+            passive_nat_workaround: false,
+            active_timeout: std::time::Duration::from_secs(10),
             accept_invalid_certs: false,
             max_connections: 4,
         }
@@ -237,6 +293,14 @@ impl<T: Transport> Pool<T> {
 
     async fn open(&self) -> Result<Stream<T>> {
         let mut stream = T::open(&self.target).await.map_err(map_ftp_error)?;
+        // How the data connection is opened has to be set before the first
+        // transfer, and every pooled connection needs it.
+        match self.target.mode {
+            FtpMode::Passive => stream.set_mode(Mode::Passive),
+            FtpMode::ExtendedPassive => stream.set_mode(Mode::ExtendedPassive),
+            FtpMode::Active => stream = stream.active_mode(self.target.active_timeout),
+        }
+        stream.set_passive_nat_workaround(self.target.passive_nat_workaround);
         let user = if self.target.user.is_empty() {
             "anonymous"
         } else {
@@ -1124,6 +1188,18 @@ mod tests {
         let b = FtpBackend::<AsyncNoTlsStream>::new("ftp".into(), target());
         assert_eq!(b.remote(&RPath::root()), "/");
         assert_eq!(b.remote(&RPath::new("/a/b.txt")), "/a/b.txt");
+    }
+
+    #[test]
+    fn the_data_connection_mode_round_trips_through_its_config_spelling() {
+        for m in [FtpMode::Passive, FtpMode::ExtendedPassive, FtpMode::Active] {
+            assert_eq!(FtpMode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(FtpMode::parse("PASV"), Some(FtpMode::Passive));
+        assert_eq!(FtpMode::parse("port"), Some(FtpMode::Active));
+        assert_eq!(FtpMode::parse("nonsense"), None);
+        // 기본값은 패시브입니다 — 공유기 뒤에서 되는 유일한 쪽입니다.
+        assert_eq!(FtpTarget::default().mode, FtpMode::Passive);
     }
 
     #[test]

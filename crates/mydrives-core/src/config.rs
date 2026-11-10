@@ -207,6 +207,20 @@ pub struct FtpConfig {
     /// factory self-signed certificate needs.
     #[serde(default)]
     pub accept_invalid_certs: bool,
+    /// How the data connection is opened: `passive` (the default, the client
+    /// dials out), `epsv` (the IPv6-capable spelling of the same thing) or
+    /// `active` (the server dials back, which needs the client reachable).
+    #[serde(default = "default_ftp_mode")]
+    pub mode: String,
+    /// Passive mode only: ignore the address `PASV` answered with and use the
+    /// one the control connection is already talking to. A server behind NAT
+    /// that was not told its public address answers with its private one, and
+    /// the data connection then goes nowhere.
+    #[serde(default)]
+    pub passive_nat_workaround: bool,
+    /// Active mode only: how long to wait for the server to connect back.
+    #[serde(default = "default_ftp_active_timeout")]
+    pub active_timeout_secs: u64,
     #[serde(default = "default_ftp_connections")]
     pub max_connections: usize,
     /// Where the password comes from. Default: the OS keychain.
@@ -226,15 +240,29 @@ fn default_ftp_connections() -> usize {
     4
 }
 
+fn default_ftp_mode() -> String {
+    "passive".to_string()
+}
+
+fn default_ftp_active_timeout() -> u64 {
+    10
+}
+
 impl FtpConfig {
     /// The spellings `security` accepts. Checked where a drive is added, so a
     /// typo is a message at that moment instead of a mount that fails later.
     pub const SECURITY_VALUES: [&'static str; 3] = ["plain", "explicit", "implicit"];
+    /// Likewise for `mode`.
+    pub const MODE_VALUES: [&'static str; 3] = ["passive", "epsv", "active"];
 
     pub fn security_is_known(value: &str) -> bool {
         Self::SECURITY_VALUES
             .iter()
             .any(|v| value.eq_ignore_ascii_case(v))
+    }
+
+    pub fn mode_is_known(value: &str) -> bool {
+        Self::MODE_VALUES.iter().any(|v| value.eq_ignore_ascii_case(v))
     }
 }
 

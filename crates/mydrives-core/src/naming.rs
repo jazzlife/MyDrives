@@ -18,8 +18,13 @@ pub fn product_name(backend: &BackendConfig) -> String {
     match backend {
         BackendConfig::Smb(smb) => nas_name(&smb.host),
         // An FTP account is on a host, not on a product: the server has no name
-        // of its own to offer, so the address is the best there is.
-        BackendConfig::Ftp(ftp) => nas_name(&ftp.host),
+        // of its own to offer, so the address is the best there is. An address
+        // with no name in it - an IP, or nothing typed yet - says "FTP" rather
+        // than "NAS", which is what the form shows before anything is filled in.
+        BackendConfig::Ftp(ftp) => match nas_name(&ftp.host) {
+            name if name == "NAS" => "FTP".to_string(),
+            name => name,
+        },
         BackendConfig::Mem(_) => "테스트 볼륨".to_string(),
         // Planned backends name themselves after the service, not the folder:
         //   Mybox(_)    => "네이버 MYBOX"
@@ -147,6 +152,29 @@ mod tests {
             product_name(&BackendConfig::Mem(MemConfig { fixture: true })),
             "테스트 볼륨"
         );
+    }
+
+    #[test]
+    fn an_ftp_drive_says_ftp_when_the_address_has_no_name_in_it() {
+        let ftp = |host: &str| {
+            BackendConfig::Ftp(crate::config::FtpConfig {
+                host: host.into(),
+                port: 21,
+                user: "u".into(),
+                subpath: None,
+                security: "explicit".into(),
+                mode: "passive".into(),
+                passive_nat_workaround: false,
+                active_timeout_secs: 10,
+                accept_invalid_certs: false,
+                max_connections: 4,
+                secret: SecretRef::Keychain,
+            })
+        };
+        assert_eq!(product_name(&ftp("files.example.com")), "files");
+        // An IP, or an empty form, must not claim to be a NAS.
+        assert_eq!(product_name(&ftp("192.168.0.10")), "FTP");
+        assert_eq!(product_name(&ftp("")), "FTP");
     }
 
     #[test]

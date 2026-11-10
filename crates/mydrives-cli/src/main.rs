@@ -155,6 +155,17 @@ enum AddKind {
         /// `plain`, `explicit` (AUTH TLS, the default) or `implicit`.
         #[arg(long, default_value = "explicit")]
         security: String,
+        /// Data connection: `passive` (default), `epsv`, or `active`.
+        #[arg(long, default_value = "passive")]
+        mode: String,
+        /// Passive mode: ignore the address PASV answered with and keep talking
+        /// to the one that is already connected. For a server behind NAT that
+        /// reports its private address.
+        #[arg(long)]
+        nat_workaround: bool,
+        /// Active mode: seconds to wait for the server to connect back.
+        #[arg(long, default_value_t = 10)]
+        active_timeout: u64,
         /// Accept a TLS certificate that does not verify - what a NAS with its
         /// factory self-signed certificate needs.
         #[arg(long)]
@@ -521,6 +532,9 @@ fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<String>, 
             user,
             password_stdin,
             security,
+            mode,
+            nat_workaround,
+            active_timeout,
             insecure_tls,
             subpath,
             drive,
@@ -543,6 +557,9 @@ fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<String>, 
             // later, when the agent builds the backend.
             if !FtpConfig::security_is_known(&security) {
                 anyhow::bail!("--security 는 plain, explicit, implicit 중 하나여야 합니다");
+            }
+            if !FtpConfig::mode_is_known(&mode) {
+                anyhow::bail!("--mode 는 passive, epsv, active 중 하나여야 합니다");
             }
             // Implicit FTPS has its own well-known port; everything else is 21.
             let port = port.unwrap_or(if security.eq_ignore_ascii_case("implicit") {
@@ -567,6 +584,9 @@ fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<String>, 
                         user,
                         subpath,
                         security,
+                        mode,
+                        passive_nat_workaround: nat_workaround,
+                        active_timeout_secs: active_timeout,
                         accept_invalid_certs: insecure_tls,
                         max_connections: 4,
                         secret: SecretRef::Keychain,
