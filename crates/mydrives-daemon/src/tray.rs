@@ -98,6 +98,8 @@ pub fn run(
         icon: None,
         actions: HashMap::new(),
         next_refresh: Instant::now(),
+        menu_signature: String::new(),
+        stats_items: HashMap::new(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -111,6 +113,11 @@ struct Tray {
     icon: Option<TrayIcon>,
     actions: HashMap<MenuId, Action>,
     next_refresh: Instant,
+    /// What the current menu was built from; see [`Tray::menu_signature`].
+    menu_signature: String,
+    /// The byte-counter line of each drive's submenu, by drive id, so the
+    /// numbers can be updated without rebuilding the menu.
+    stats_items: HashMap<String, MenuItem>,
 }
 
 impl Tray {
@@ -118,6 +125,7 @@ impl Tray {
     fn build_menu(&mut self) -> anyhow::Result<Menu> {
         let menu = Menu::new();
         self.actions.clear();
+        self.stats_items.clear();
 
         let remotes = self.manager.status();
 
@@ -188,15 +196,11 @@ impl Tray {
             }
             if let Some(stats) = r.stats {
                 submenu.append(&PredefinedMenuItem::separator())?;
-                submenu.append(&MenuItem::new(
-                    format!(
-                        "읽기 {} / 쓰기 {}",
-                        human(stats.bytes_read),
-                        human(stats.bytes_written)
-                    ),
-                    false,
-                    None,
-                ))?;
+                // Kept by id so `refresh` can rewrite the numbers in place
+                // without rebuilding the menu - see there for why that matters.
+                let counters = MenuItem::new(stats_text(&stats), false, None);
+                submenu.append(&counters)?;
+                self.stats_items.insert(r.id.clone(), counters);
                 if stats.errors > 0 {
                     submenu.append(&MenuItem::new(
                         format!("오류 {}건", stats.errors),
@@ -254,23 +258,63 @@ impl Tray {
         Ok(menu)
     }
 
+    /// Brings the menu up to date with the mount manager.
+    ///
+    /// The menu is only *rebuilt* when something it shows has changed. On
+    /// macOS, handing the status item a new NSMenu closes the one that is open,
+    /// so a rebuild every few seconds meant the menu slammed shut under the
+    /// pointer whenever the timer fired - the user got about five seconds to
+    /// pick an item. The byte counters change constantly, so they are updated
+    /// in place on the items that already exist instead of counting as a
+    /// change.
     fn refresh(&mut self) {
-        match self.build_menu() {
-            Ok(menu) => {
-                if let Some(icon) = &self.icon {
-                    icon.set_menu(Some(Box::new(menu)));
-                    let tip = self
-                        .manager
-                        .status()
-                        .iter()
-                        .filter(|r| r.state.is_live())
-                        .count();
-                    let _ = icon.set_tooltip(Some(format!("MyDrives - {tip} mounted")));
+        let signature = self.menu_signature();
+        if signature != self.menu_signature {
+            match self.build_menu() {
+                Ok(menu) => {
+                    if let Some(icon) = &self.icon {
+                        icon.set_menu(Some(Box::new(menu)));
+                    }
+                    self.menu_signature = signature;
+                }
+                Err(e) => tracing::warn!(error = %e, "rebuilding the tray menu failed"),
+            }
+        } else {
+            for r in self.manager.status() {
+                if let (Some(item), Some(stats)) = (self.stats_items.get(&r.id), r.stats) {
+                    item.set_text(stats_text(&stats));
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "rebuilding the tray menu failed"),
+        }
+        if let Some(icon) = &self.icon {
+            let tip = self
+                .manager
+                .status()
+                .iter()
+                .filter(|r| r.state.is_live())
+                .count();
+            let _ = icon.set_tooltip(Some(format!("MyDrives - {tip} mounted")));
         }
         self.next_refresh = Instant::now() + REFRESH;
+    }
+
+    /// Everything the menu's *structure* depends on, as one string. Equal
+    /// strings mean the menu can stay as it is.
+    fn menu_signature(&self) -> String {
+        let mut sig = String::new();
+        for r in self.manager.status() {
+            // Error counts are in here on purpose: the "오류 N건" line appears
+            // only once there is one, which changes the shape of the submenu.
+            let errors = r.stats.map(|s| s.errors).unwrap_or(0);
+            sig.push_str(&format!(
+                "{}|{}|{:?}|{}|{}\n",
+                r.id, r.label, r.state, r.source, errors
+            ));
+        }
+        let status = self.updates.status();
+        sig.push_str(&format!("update:{}|{:?}\n", status.summary(), status.state));
+        sig.push_str(&format!("autostart:{}", self.config.lock().general.autostart));
+        sig
     }
 
     fn perform(&mut self, action: Action, event_loop: &ActiveEventLoop) {
@@ -394,6 +438,15 @@ impl ApplicationHandler<UserEvent> for Tray {
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_refresh));
     }
+}
+
+/// The byte-counter line of a drive's submenu.
+fn stats_text(stats: &mydrives_core::manager::StatsSnapshot) -> String {
+    format!(
+        "읽기 {} / 쓰기 {}",
+        human(stats.bytes_read),
+        human(stats.bytes_written)
+    )
 }
 
 fn short(text: &str) -> String {

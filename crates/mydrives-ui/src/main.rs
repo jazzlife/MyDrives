@@ -1205,11 +1205,14 @@ impl App {
                     field(ui, p, "이름", |ui| {
                         let r = ui.add(
                             egui::TextEdit::singleline(&mut form.name)
-                                .hint_text("NAS 이름 (비워 두면 자동)")
+                                .hint_text("비워 두면 저장할 때 서버 이름으로")
                                 .desired_width(260.0),
                         );
+                        // 한 번이라도 손댔으면 다시 채우지 않습니다. 비우는 순간
+                        // 다시 채워 넣으면 지우고 새로 적을 방법이 없습니다 - 비운
+                        // 채로 저장하면 에이전트가 서버 이름을 넣습니다.
                         if r.changed() {
-                            form.name_edited = !form.name.trim().is_empty();
+                            form.name_edited = true;
                         }
                     });
                     field(ui, p, "계정", |ui| {
@@ -1278,11 +1281,12 @@ impl App {
                         field(ui, p, "드라이브 이름", |ui| {
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut form.id)
-                                    .hint_text("비워 두면 공유 폴더 이름")
+                                    .hint_text("마운트 폴더 이름이 됩니다")
                                     .desired_width(260.0),
                             );
+                            // 위의 "이름"과 같은 이유로, 손댄 뒤에는 따라가지 않습니다.
                             if r.changed() {
-                                form.id_edited = !form.id.trim().is_empty();
+                                form.id_edited = true;
                             }
                         });
                         // 포트는 두 종류 모두 기본 칸에 있습니다. 여기서는
@@ -1313,8 +1317,10 @@ impl App {
             });
         }
 
-        // 호스트·공유 이름을 바꾸면 이름과 마운트 폴더가 따라옵니다.
-        if source_changed || form.mountpoint.is_empty() || form.name.is_empty() {
+        // 호스트·공유 이름을 바꾸면 (아직 손대지 않은) 이름과 마운트 폴더가
+        // 따라옵니다. 칸이 비었다는 이유로는 다시 채우지 않습니다 - 사용자가
+        // 지운 것일 수 있고, 그걸 즉시 되돌리면 칸을 새로 적을 수가 없습니다.
+        if source_changed {
             form.follow_sources(&taken, &taken_ids);
         }
 
@@ -1743,6 +1749,35 @@ mod tests {
         assert_eq!(clean_subpath("photos/2026"), Some("/photos/2026".into()));
         assert_eq!(clean_subpath("/photos/"), Some("/photos".into()));
         assert_eq!(clean_subpath("   "), None);
+    }
+
+    /// 이름 칸을 비우고 새로 적으려 하면, 비는 순간 호스트 이름으로 다시
+    /// 채워져 적을 수가 없었습니다. 손댄 칸은 그대로 둬야 합니다.
+    #[test]
+    fn a_field_the_user_cleared_stays_cleared() {
+        let mut form = Form {
+            home: "/Users/x".into(),
+            ..Form::default()
+        };
+        form.host = "turtlelab.ddns.net".into();
+        form.share = "jazzlife".into();
+        form.follow_sources(&[], &[]);
+        assert_eq!(form.name, "turtlelab");
+
+        // 사용자가 이름을 지웠다 (= changed 이벤트, 값은 빈 문자열).
+        form.name.clear();
+        form.name_edited = true;
+        // 호스트를 고쳐도 이름은 다시 채워지지 않습니다.
+        form.host = "other.example.com".into();
+        form.follow_sources(&[], &[]);
+        assert_eq!(form.name, "");
+
+        // 드라이브 이름(id)도 마찬가지입니다.
+        form.id.clear();
+        form.id_edited = true;
+        form.share = "Public".into();
+        form.follow_sources(&[], &[]);
+        assert_eq!(form.id, "");
     }
 
     #[test]
