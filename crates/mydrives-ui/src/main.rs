@@ -436,6 +436,16 @@ impl Form {
     }
 }
 
+/// 설정 파일에 쓰이는 백엔드 이름을 화면에 쓸 이름으로.
+fn kind_label(kind: &str) -> &str {
+    match kind {
+        "smb" => "NAS (SMB)",
+        "ftp" => "FTP",
+        "mem" => "테스트",
+        other => other,
+    }
+}
+
 /// `nas.example.com:5445` 처럼 포트가 붙어 들어온 주소를 갈라 놓습니다.
 ///
 /// NAS 관리 화면도, 공유 주소도 포트를 붙여 보여 주므로 사람은 그대로 붙여
@@ -832,10 +842,16 @@ impl App {
             FontId::proportional(13.0),
             text,
         );
+        // 목록에서 "이게 NAS 드라이브인지 FTP인지"가 보여야 합니다. 같은 서버를
+        // 두 가지 방법으로 붙여 쓰는 일이 흔하고, 그때 둘을 가르는 것은 종류뿐입니다.
         painter.text(
             egui::pos2(rect.left() + 28.0, rect.center().y + 8.0),
             Align2::LEFT_CENTER,
-            ellipsize(&short_state(&r.state), 26),
+            format!(
+                "{} · {}",
+                kind_label(&r.kind),
+                ellipsize(&short_state(&r.state), 20)
+            ),
             FontId::proportional(11.0),
             dim,
         );
@@ -915,6 +931,7 @@ impl App {
                 }
             });
             info_row(ui, p, "드라이브 이름", &r.id);
+            info_row(ui, p, "종류", kind_label(&r.kind));
             info_row(ui, p, "상태", &state_detail(&r.state));
             info_row(
                 ui,

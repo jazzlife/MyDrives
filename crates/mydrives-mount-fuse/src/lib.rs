@@ -458,10 +458,13 @@ impl FuseFs {
 /// (FUSE-T splits the mount command on spaces), everything outside
 /// `A-Za-z0-9._-` is dropped, and a DNS label has 63 bytes to spend.
 ///
-/// It carries the application's name in front of the drive's, because what is
-/// left of a drive called "거북이 NAS" is "NAS" - and a real NAS answering to
-/// that name on the same network would take the mount with it. A drive with
-/// nothing usable left keeps the application's name alone.
+/// What the user named the drive is what the sidebar says. An earlier version
+/// put the application's name in front of every one of them, in case a drive
+/// called "거북이 NAS" came out as plain "NAS" and collided with a real NAS on
+/// the network. That traded a rare collision for a name nobody asked for on
+/// *every* drive - and Bonjour resolves collisions by itself anyway, by
+/// appending a number. Only a name with nothing usable left in it falls back to
+/// the application's.
 // Only the FUSE-T branch calls it; the tests cover it everywhere.
 #[cfg_attr(
     not(all(target_os = "macos", feature = "macfuse")),
@@ -480,14 +483,14 @@ fn location_name(volume_name: &str) -> String {
         if ch == '-' && out.ends_with('-') {
             continue;
         }
-        if APP.len() + 1 + out.len() == LABEL_MAX {
+        if out.len() == LABEL_MAX {
             break;
         }
         out.push(ch);
     }
     match out.trim_matches(['-', '.', '_']) {
         "" => APP.to_string(),
-        name => format!("{APP}-{name}"),
+        name => name.to_string(),
     }
 }
 
@@ -895,12 +898,15 @@ mod tests {
 
     #[test]
     fn location_name_survives_the_mount_command_and_bonjour() {
+        // The name the user gave the drive is the name the sidebar shows.
+        assert_eq!(location_name("QNAP"), "QNAP");
+        assert_eq!(location_name("FTP"), "FTP");
         // The space is what used to tear FUSE-T's mount command in half.
-        assert_eq!(location_name("  Office  NAS  "), "MyDrives-Office-NAS");
-        assert_eq!(location_name("backup/2025:주말"), "MyDrives-backup2025");
+        assert_eq!(location_name("  Office  NAS  "), "Office-NAS");
+        assert_eq!(location_name("backup/2025:주말"), "backup2025");
         // Bonjour has to resolve the name, and a non-ASCII one never does.
-        // "NAS" on its own is also what the NAS in the hall answers to.
-        assert_eq!(location_name("거북이 NAS"), "MyDrives-NAS");
+        assert_eq!(location_name("거북이 NAS"), "NAS");
+        // Only a name with nothing left in it falls back to the app's own.
         assert_eq!(location_name("거북이"), "MyDrives");
         assert_eq!(location_name("   "), "MyDrives");
         assert_eq!(location_name("///"), "MyDrives");
