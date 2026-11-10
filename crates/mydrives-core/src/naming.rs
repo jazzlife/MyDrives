@@ -77,6 +77,45 @@ pub fn ftp_default_id(host: &str, subpath: Option<&str>) -> String {
     }
 }
 
+/// An id no other drive is using.
+///
+/// The id is the config key, the keychain account *and* the mount folder, so
+/// two drives sharing one would fight over all three - and adding the second
+/// would quietly replace the first. Unlike a label this ends up in a path, so
+/// the disambiguator is a dash rather than brackets.
+pub fn unique_id(base: &str, taken: &[String]) -> String {
+    let base = match base.trim() {
+        "" => "drive",
+        other => other,
+    };
+    if !taken.iter().any(|t| t == base) {
+        return base.to_string();
+    }
+    (2..1000)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !taken.iter().any(|t| t == candidate))
+        .unwrap_or_else(|| base.to_string())
+}
+
+/// Do two backends point at the same place?
+///
+/// Adding a drive whose id is already taken means one of two very different
+/// things: the same drive being reconfigured (fine), or a *different* drive
+/// that happens to have been given the same name - and accepting that one
+/// silently throws the first drive's settings away.
+pub fn same_target(a: &BackendConfig, b: &BackendConfig) -> bool {
+    match (a, b) {
+        (BackendConfig::Smb(x), BackendConfig::Smb(y)) => {
+            x.host.eq_ignore_ascii_case(&y.host) && x.share == y.share
+        }
+        (BackendConfig::Ftp(x), BackendConfig::Ftp(y)) => {
+            x.host.eq_ignore_ascii_case(&y.host) && x.subpath == y.subpath
+        }
+        (BackendConfig::Mem(_), BackendConfig::Mem(_)) => true,
+        _ => false,
+    }
+}
+
 /// `base`, or something close to it that no other drive is using.
 ///
 /// The share name is the first thing tried as a disambiguator, because two
@@ -185,6 +224,31 @@ mod tests {
         let taken = vec!["turtlelab".into(), "turtlelab (Public)".into()];
         assert_eq!(unique_label("turtlelab", "Public", &taken), "turtlelab 2");
         assert_eq!(unique_label("turtlelab", "", &taken), "turtlelab 2");
+    }
+
+    #[test]
+    fn an_id_in_use_is_never_handed_out_twice() {
+        assert_eq!(unique_id("jazzlife", &[]), "jazzlife");
+        assert_eq!(unique_id("jazzlife", &["jazzlife".into()]), "jazzlife-2");
+        assert_eq!(
+            unique_id("jazzlife", &["jazzlife".into(), "jazzlife-2".into()]),
+            "jazzlife-3"
+        );
+        // 경로가 되는 이름이라 괄호가 아니라 하이픈으로 구분합니다.
+        assert!(!unique_id("data", &["data".into()]).contains(' '));
+    }
+
+    #[test]
+    fn the_same_drive_may_be_reconfigured_but_a_different_one_may_not_take_its_place() {
+        let nas = smb("turtlelab.ddns.net", "jazzlife");
+        // 같은 NAS·같은 공유 = 같은 드라이브를 고쳐 쓰는 것.
+        assert!(same_target(&nas, &smb("turtlelab.ddns.net", "jazzlife")));
+        // 다른 공유, 다른 프로토콜은 "다른 드라이브"입니다.
+        assert!(!same_target(&nas, &smb("turtlelab.ddns.net", "public")));
+        assert!(!same_target(
+            &nas,
+            &BackendConfig::Mem(MemConfig { fixture: true })
+        ));
     }
 
     #[test]

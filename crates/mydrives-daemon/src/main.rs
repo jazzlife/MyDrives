@@ -440,6 +440,31 @@ async fn handle(
             false,
         ),
         Request::Add { mut remote, secret: s } => {
+            // The id is the config key, the keychain account and the mount
+            // folder all at once, so adding a drive under a name another drive
+            // already uses replaces it - settings, password and all. That is
+            // never what "add" means: a drive pointing somewhere else is
+            // refused here rather than quietly swallowing the first one.
+            if let Some(existing) = config
+                .lock()
+                .remotes
+                .iter()
+                .find(|r| r.id == remote.id)
+                .cloned()
+            {
+                if !mydrives_core::naming::same_target(&existing.backend, &remote.backend) {
+                    return (
+                        Response::Error {
+                            message: format!(
+                                "'{}' 이름은 이미 '{}' 드라이브가 쓰고 있습니다 — 다른 이름을 쓰거나 그 드라이브를 먼저 지우세요",
+                                remote.id,
+                                existing.display_label()
+                            ),
+                        },
+                        false,
+                    );
+                }
+            }
             // A caller that did not pick a name gets the product's: the NAS, or
             // the service. Done here rather than in the CLI or the window
             // because only the agent knows which names are already taken.

@@ -303,7 +303,7 @@ impl Form {
     /// 보이는 **이름**은 제품(NAS·서비스) 이름을 따르고, **id와 마운트 폴더**는
     /// 공유 폴더 이름을 따릅니다 — 이름은 "어느 장비인가"를, 경로는 "어느
     /// 폴더인가"를 말해야 하기 때문입니다.
-    fn follow_sources(&mut self, taken: &[String]) {
+    fn follow_sources(&mut self, taken: &[String], taken_ids: &[String]) {
         // SMB는 공유 폴더가, FTP는 계정 안의 경로가 "어느 폴더인가"에 해당합니다.
         let share = match self.kind {
             DriveKind::Smb => self.share.trim().to_string(),
@@ -313,11 +313,19 @@ impl Form {
             self.port = self.default_port().to_string();
         }
         if !self.id_edited {
-            self.id = match self.kind {
+            let base = match self.kind {
                 DriveKind::Smb => share.clone(),
                 DriveKind::Ftp => {
                     mydrives_core::naming::ftp_default_id(self.host.trim(), opt(&self.subpath).as_deref())
                 }
+            };
+            // 이름이 겹치면 **기존 드라이브를 덮어씁니다** — id가 설정 키이자
+            // 키체인 계정이자 마운트 폴더이기 때문입니다. 겹치지 않는 이름을
+            // 먼저 제안합니다.
+            self.id = if base.trim().is_empty() {
+                base
+            } else {
+                mydrives_core::naming::unique_id(&base, taken_ids)
             };
         }
         if !self.name_edited {
@@ -976,11 +984,10 @@ impl App {
         });
         ui.add_space(10.0);
         // 이름이 이미 쓰이고 있는지 보려면 지금 있는 드라이브들의 이름이 필요합니다.
-        let taken: Vec<String> = self
-            .remotes
-            .iter()
-            .map(|r| r.label.clone())
-            .collect();
+        // 보이는 이름(label)과 드라이브 이름(id)은 쓰임이 달라 따로 봅니다 —
+        // id가 겹치면 기존 드라이브를 덮어쓰기 때문입니다.
+        let taken: Vec<String> = self.remotes.iter().map(|r| r.label.clone()).collect();
+        let taken_ids: Vec<String> = self.remotes.iter().map(|r| r.id.clone()).collect();
 
         card(ui, p, |ui| {
             egui::Grid::new("form-main")
@@ -1218,7 +1225,7 @@ impl App {
 
         // 호스트·공유 이름을 바꾸면 이름과 마운트 폴더가 따라옵니다.
         if source_changed || form.mountpoint.is_empty() || form.name.is_empty() {
-            form.follow_sources(&taken);
+            form.follow_sources(&taken, &taken_ids);
         }
 
         ui.add_space(18.0);
@@ -1514,7 +1521,7 @@ mod tests {
         };
         form.host = "turtlelab.ddns.net".into();
         form.share = "Public".into();
-        form.follow_sources(&[]);
+        form.follow_sources(&[], &[]);
 
         // 경로는 공유 폴더를, 이름은 장비를 따릅니다.
         assert_eq!(form.id, "Public");
@@ -1524,7 +1531,7 @@ mod tests {
         }
 
         // 같은 NAS의 두 번째 공유는 이름이 겹치지 않게 공유 이름이 붙습니다.
-        form.follow_sources(&["turtlelab".to_string()]);
+        form.follow_sources(&["turtlelab".to_string()], &[]);
         assert_eq!(form.name, "turtlelab (Public)");
 
         // 사용자가 직접 고친 칸은 따라가지 않습니다.
@@ -1533,7 +1540,7 @@ mod tests {
         form.name = "거북이".into();
         form.name_edited = true;
         form.share = "Other".into();
-        form.follow_sources(&[]);
+        form.follow_sources(&[], &[]);
         assert_eq!(form.id, "nas");
         assert_eq!(form.name, "거북이");
     }
@@ -1547,7 +1554,7 @@ mod tests {
         };
         form.host = "files.example.com".into();
         form.subpath = "/public_html".into();
-        form.follow_sources(&[]);
+        form.follow_sources(&[], &[]);
 
         assert_eq!(form.id, "public_html");
         assert_eq!(form.name, "files");
@@ -1556,19 +1563,19 @@ mod tests {
 
         // 계정 전체를 쓰면 이름 삼을 폴더가 없으므로 호스트를 따릅니다.
         form.subpath.clear();
-        form.follow_sources(&[]);
+        form.follow_sources(&[], &[]);
         assert_eq!(form.id, "files");
 
         // 암묵적 FTPS만 포트가 다릅니다.
         form.security = "implicit".into();
-        form.follow_sources(&[]);
+        form.follow_sources(&[], &[]);
         assert_eq!(form.port, "990");
 
         // 포트를 직접 고치면 보안 설정이 바뀌어도 그 값을 지킵니다.
         form.port = "2121".into();
         form.port_edited = true;
         form.security = "plain".into();
-        form.follow_sources(&[]);
+        form.follow_sources(&[], &[]);
         assert_eq!(form.port, "2121");
 
         // 데이터 연결은 패시브가 기본입니다.
@@ -1585,6 +1592,34 @@ mod tests {
         form.drive = "Z:".into();
         form.mountpoint = "/Users/x/MyDrives/files".into();
         assert!(form.validate().is_ok());
+    }
+
+    /// 사용자가 실제로 당한 일: NAS 드라이브 `jazzlife`가 있는데 같은 계정의
+    /// FTP를 `/jazzlife` 폴더로 추가했더니, 기본 이름이 똑같이 `jazzlife`라
+    /// **기존 NAS 드라이브 설정이 통째로 교체**됐습니다.
+    #[test]
+    fn a_new_drive_never_takes_a_name_another_drive_is_using() {
+        let mut form = Form {
+            home: "/Users/x".into(),
+            kind: DriveKind::Ftp,
+            ..Form::default()
+        };
+        form.host = "turtlelab.ddns.net".into();
+        form.subpath = "/jazzlife".into();
+
+        // 비어 있을 때는 폴더 이름 그대로.
+        form.follow_sources(&[], &[]);
+        assert_eq!(form.id, "jazzlife");
+
+        // 그 이름을 쓰는 드라이브가 이미 있으면 다른 이름을 제안합니다.
+        form.follow_sources(&[], &["jazzlife".to_string()]);
+        assert_eq!(form.id, "jazzlife-2");
+        if !cfg!(windows) {
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/jazzlife-2");
+        }
+
+        form.follow_sources(&[], &["jazzlife".to_string(), "jazzlife-2".to_string()]);
+        assert_eq!(form.id, "jazzlife-3");
     }
 
     #[test]
