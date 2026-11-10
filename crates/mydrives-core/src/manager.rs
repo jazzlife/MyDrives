@@ -97,6 +97,7 @@ pub struct MountManager {
     order: Mutex<Vec<String>>,
     probe_interval: Duration,
     mount_root: std::path::PathBuf,
+    sudo_mount: bool,
 }
 
 impl MountManager {
@@ -120,6 +121,7 @@ impl MountManager {
             order: Mutex::new(Vec::new()),
             probe_interval: Duration::from_secs(config.general.probe_secs.max(5)),
             mount_root,
+            sudo_mount: config.general.sudo_mount,
         });
         for cfg in &config.remotes {
             mgr.put(cfg.clone());
@@ -312,7 +314,7 @@ impl MountManager {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
-            create_mount_point(path)?;
+            create_mount_point(path, self.sudo_mount)?;
         }
         let provider = mount::select(&self.providers, cfg.provider.as_deref(), &target)?;
 
@@ -330,6 +332,7 @@ impl MountManager {
             readonly: cfg.readonly,
             volume_name: cfg.display_label().to_string(),
             source: backend.describe(),
+            sudo_mount: sudo_allowed(self.sudo_mount),
         };
 
         // Mounting blocks: FUSE waits for the kernel handshake, WinFsp waits for
@@ -390,7 +393,7 @@ impl MountManager {
             if let Ok(MountTarget::Path(path)) = self.target_for(&cfg) {
                 if let Ok(mut entries) = std::fs::read_dir(&path) {
                     if entries.next().is_none() {
-                        remove_mount_point(&path);
+                        remove_mount_point(&path, self.sudo_mount);
                     }
                 }
             }
@@ -502,13 +505,26 @@ impl MountManager {
     }
 }
 
+/// May the agent reach for `sudo -n` to make a mount point?
+///
+/// The setting lives in the config file because the agent is started four
+/// different ways - launchd, Finder, the installer, its own updater - and only
+/// one of them passes an environment along. `MYDRIVES_SUDO_MOUNT` stays as an
+/// override for a developer running it from a shell.
+fn sudo_allowed(sudo_mount: bool) -> bool {
+    match std::env::var("MYDRIVES_SUDO_MOUNT") {
+        Ok(v) => v == "1",
+        Err(_) => sudo_mount,
+    }
+}
+
 /// Creates the mount point, escalating only where the OS requires it.
 ///
 /// `/Volumes` on macOS is root-owned, and that is exactly where a mount has to
 /// live for Finder to treat it as a **volume** (sidebar entry, eject button,
 /// desktop icon) instead of a folder that happens to be mounted. Everywhere else
 /// an ordinary mkdir is enough and no privileges are involved.
-fn create_mount_point(path: &std::path::Path) -> Result<()> {
+fn create_mount_point(path: &std::path::Path, sudo_mount: bool) -> Result<()> {
     match std::fs::create_dir_all(path) {
         Ok(()) => return Ok(()),
         Err(e) if e.kind() != std::io::ErrorKind::PermissionDenied => {
@@ -518,10 +534,10 @@ fn create_mount_point(path: &std::path::Path) -> Result<()> {
             )))
         }
         Err(e) => {
-            if std::env::var("MYDRIVES_SUDO_MOUNT").as_deref() != Ok("1") {
+            if !sudo_allowed(sudo_mount) {
                 return Err(Error::PermissionDenied(format!(
                     "{} 을(를) 만들 수 없습니다: {e}. /Volumes 아래에 마운트하려면 권한이 필요합니다 \
-                     (MYDRIVES_SUDO_MOUNT=1 로 sudo 허용, 또는 홈 폴더 아래 경로를 쓰세요)",
+                     (설정의 [general] sudo_mount = true 로 sudo 허용, 또는 홈 폴더 아래 경로를 쓰세요)",
                     path.display()
                 )));
             }
@@ -558,12 +574,12 @@ fn create_mount_point(path: &std::path::Path) -> Result<()> {
 }
 
 /// Removes an empty mount point, with the same privilege rules as creating it.
-fn remove_mount_point(path: &std::path::Path) {
+fn remove_mount_point(path: &std::path::Path, sudo_mount: bool) {
     if std::fs::remove_dir(path).is_ok() {
         return;
     }
     #[cfg(unix)]
-    if std::env::var("MYDRIVES_SUDO_MOUNT").as_deref() == Ok("1") {
+    if sudo_allowed(sudo_mount) {
         let _ = std::process::Command::new("sudo")
             .args(["-n", "rmdir"])
             .arg(path)
@@ -603,4 +619,58 @@ fn expand_tilde(p: &str) -> std::path::PathBuf {
         }
     }
     std::path::PathBuf::from(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sudo_is_off_until_the_config_asks_for_it() {
+        // The environment override is a developer's, and tests share one
+        // process, so this only covers the configured answer.
+        if std::env::var_os("MYDRIVES_SUDO_MOUNT").is_some() {
+            return;
+        }
+        assert!(!sudo_allowed(false));
+        assert!(sudo_allowed(true));
+        assert!(!AppConfig::default().general.sudo_mount);
+    }
+
+    #[test]
+    fn a_drive_with_no_mount_point_of_its_own_lands_under_the_root() {
+        let mut config = AppConfig::default();
+        config.general.mount_root = Some("/tmp/mydrives-test-root".into());
+        let mgr = MountManager::new(
+            tokio::runtime::Handle::try_current()
+                .unwrap_or_else(|_| TEST_RT.handle().clone()),
+            Vec::new(),
+            Arc::new(NoFactory),
+            &config,
+        );
+        let cfg = RemoteConfig {
+            id: "nas".into(),
+            label: String::new(),
+            automount: false,
+            readonly: false,
+            provider: None,
+            drive: None,
+            mountpoint: None,
+            backend: crate::config::BackendConfig::Mem(crate::config::MemConfig { fixture: true }),
+        };
+        match mgr.target_for(&cfg).unwrap() {
+            MountTarget::Path(p) => assert_eq!(p, std::path::Path::new("/tmp/mydrives-test-root/nas")),
+            other => panic!("expected a path, got {other:?}"),
+        }
+    }
+
+    struct NoFactory;
+    impl BackendFactory for NoFactory {
+        fn build(&self, _cfg: &RemoteConfig) -> Result<Arc<dyn Backend>> {
+            Err(Error::Unsupported("test".into()))
+        }
+    }
+
+    static TEST_RT: std::sync::LazyLock<tokio::runtime::Runtime> =
+        std::sync::LazyLock::new(|| tokio::runtime::Runtime::new().expect("test runtime"));
 }

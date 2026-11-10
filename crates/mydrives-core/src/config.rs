@@ -75,6 +75,16 @@ pub struct General {
     /// it, never just because the agent started.
     #[serde(default = "default_true")]
     pub fuse_t_auto_install: bool,
+    /// Let the agent use `sudo -n` to make a mount point the user cannot
+    /// create, which on macOS means anything directly under `/Volumes`.
+    ///
+    /// Off by default, and it belongs here rather than in an environment
+    /// variable: the agent is started by launchd, by Finder, by the installer
+    /// and by its own updater, and only one of those passes an environment on.
+    /// A machine where `sudo -n` asks for a password gets the same clear error
+    /// either way.
+    #[serde(default)]
+    pub sudo_mount: bool,
     /// Start the agent when the user logs in. Reconciled on every start, so an
     /// agent moved or rebuilt elsewhere re-points the login item at itself
     /// instead of leaving one that launches a binary that is no longer there.
@@ -97,6 +107,7 @@ impl Default for General {
             probe_secs: default_probe_secs(),
             show_tray: true,
             fuse_t_auto_install: true,
+            sudo_mount: false,
             autostart: true,
         }
     }

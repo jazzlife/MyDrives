@@ -177,6 +177,46 @@ jobs:
             "{0}  {1}" -f (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower(), $_.Name
           } | Set-Content -Encoding ascii "SHA256SUMS.${{ matrix.id }}"
 
+      # The loose executables above are what the agent's updater downloads. A
+      # person downloads one of these instead.
+      - name: Installer (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          mkdir -p pkg
+          packaging/macos/make-app.sh "${tag#v}" pkg \
+            target/aarch64-apple-darwin/release target/x86_64-apple-darwin/release
+          # The bundle and the icon pieces were scaffolding for the image.
+          rm -rf pkg/MyDrives.app pkg/icon.iconset pkg/icon.png pkg/icon.ico
+          (cd pkg && shasum -a 256 ./*.dmg | sed 's#\./##' >> "../dist/SHA256SUMS.${{ matrix.id }}")
+
+      - name: Installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          $version = "${{ github.event.inputs.tag || github.ref_name }}".TrimStart('v')
+          New-Item -ItemType Directory -Force pkg, build\win | Out-Null
+          foreach ($b in "mydrivesd", "mydrives", "mydrives-ui") {
+            Copy-Item "target\x86_64-pc-windows-msvc\release\$b.exe" build\win
+          }
+          python packaging\icon.py build\win
+          & $iscc /Qp "/DMyDrivesVersion=$version" "/DBinDir=$((Resolve-Path build\win).Path)" `
+                  "/O$((Resolve-Path pkg).Path)" packaging\windows\mydrives.iss
+          Get-ChildItem pkg -Filter *.exe | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          } | Add-Content -Encoding ascii "dist\SHA256SUMS.${{ matrix.id }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.id }}
+          path: pkg/*
+          if-no-files-found: error
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.id }}
@@ -194,8 +234,11 @@ jobs:
       - name: Collect the binaries and merge the checksums
         run: |
           mkdir -p dist
-          find artifacts -type f -name 'mydrives*' -exec cp {} dist/ \;
-          cat artifacts/*/SHA256SUMS.* > dist/SHA256SUMS
+          # The executables the updater fetches, then the two installers.
+          find artifacts/dist-* -type f -name 'mydrives*' -exec cp {} dist/ \;
+          find artifacts/pkg-* -type f \( -name '*.dmg' -o -name '*setup.exe' \) \
+            -exec cp {} dist/ \;
+          cat artifacts/dist-*/SHA256SUMS.* > dist/SHA256SUMS
           ls -l dist
           cat dist/SHA256SUMS
 

@@ -162,7 +162,9 @@ impl MountProvider for NfsProvider {
             }
         };
 
-        match run_mount(&path, port, spec.readonly, self.allow_sudo) {
+        // The spec carries what the config says; `with_sudo` (and the env
+        // override behind it) stays for a provider built outside the manager.
+        match run_mount(&path, port, spec.readonly, self.allow_sudo || spec.sudo_mount) {
             Ok(used_sudo) => {
                 tracing::info!(
                     mountpoint = %path.display(),
@@ -256,7 +258,7 @@ fn run_mount(path: &PathBuf, port: u16, readonly: bool, allow_sudo: bool) -> Res
     if !allow_sudo {
         return Err(Error::PermissionDenied(format!(
             "mounting {target} failed: {stderr}. Mounting needs privileges: \
-             set MYDRIVES_SUDO_MOUNT=1 to let the agent use `sudo -n`, or install \
+             set [general] sudo_mount = true to let the agent use `sudo -n`, or install \
              the privileged mount helper"
         )));
     }

@@ -48,6 +48,10 @@ pub struct MountSpec {
     pub volume_name: String,
     /// Backend description, used for the Finder/Explorer "network path" column.
     pub source: String,
+    /// May the mount layer escalate with `sudo -n`? Comes from the config
+    /// (`[general] sudo_mount`), because the agent is started in ways that
+    /// carry no environment of their own.
+    pub sudo_mount: bool,
 }
 
 /// A live mount. Dropping it must not leave the OS with a dangling mount point,
