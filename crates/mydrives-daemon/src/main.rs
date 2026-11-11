@@ -438,6 +438,17 @@ async fn handle(
             },
             false,
         ),
+        Request::Describe { id } => match manager.config_of(&id) {
+            // The config's SecretRef names the keychain, it is not the
+            // password, so sending it back is safe.
+            Some(remote) => (Response::Described { remote }, false),
+            None => (
+                Response::Error {
+                    message: format!("'{id}' 드라이브가 없습니다"),
+                },
+                false,
+            ),
+        },
         Request::Providers => (
             Response::Providers {
                 providers: manager
@@ -451,19 +462,47 @@ async fn handle(
             },
             false,
         ),
-        Request::Add { mut remote, secret: s } => {
+        Request::Add {
+            mut remote,
+            secret: s,
+            replace,
+        } => {
             // The id is the config key, the keychain account and the mount
             // folder all at once, so adding a drive under a name another drive
             // already uses replaces it - settings, password and all. That is
             // never what "add" means: a drive pointing somewhere else is
-            // refused here rather than quietly swallowing the first one.
-            if let Some(existing) = config
+            // refused here rather than quietly swallowing the first one. An
+            // edit (`replace`) is the one case where pointing the same id
+            // somewhere new is exactly what was asked.
+            if replace && manager.config_of(&remote.id).is_none() {
+                return (
+                    Response::Error {
+                        message: format!("'{}' 드라이브가 없습니다", remote.id),
+                    },
+                    false,
+                );
+            }
+            if replace
+                && manager
+                    .status()
+                    .iter()
+                    .any(|r| r.id == remote.id && r.state.is_live())
+            {
+                return (
+                    Response::Error {
+                        message: "연결된 드라이브는 고칠 수 없습니다 - 먼저 연결을 해제하세요".into(),
+                    },
+                    false,
+                );
+            }
+            let existing = config
                 .lock()
                 .remotes
                 .iter()
                 .find(|r| r.id == remote.id)
                 .cloned()
-            {
+                .filter(|_| !replace);
+            if let Some(existing) = existing {
                 if !mydrives_core::naming::same_target(&existing.backend, &remote.backend) {
                     return (
                         Response::Error {

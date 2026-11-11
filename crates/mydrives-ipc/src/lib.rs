@@ -34,7 +34,16 @@ pub enum Request {
     Ping,
     Status,
     Providers,
-    Add { remote: RemoteConfig, secret: Option<String> },
+    /// `replace` says this is an edit of the drive already called `remote.id`:
+    /// its settings may point somewhere new, and a `None` secret keeps the
+    /// stored one. Without it, an id already in use by a drive pointing
+    /// elsewhere is refused, so a typo cannot swallow another drive.
+    Add {
+        remote: RemoteConfig,
+        secret: Option<String>,
+        #[serde(default)]
+        replace: bool,
+    },
     /// Try the settings without saving anything: connect, read the root, done.
     /// The UI calls this before `Add` so a typo in the host or password is
     /// reported immediately instead of becoming a failed mount later.
@@ -42,6 +51,9 @@ pub enum Request {
     /// Ask the server which shares it offers (the `share` field is ignored).
     ListShares { remote: RemoteConfig, secret: Option<String> },
     Remove { id: String },
+    /// A drive's saved settings, so the editor can open pre-filled. The reply
+    /// carries no secret - its `SecretRef` only says where the password lives.
+    Describe { id: String },
     /// Change what a drive is called (the label, not the id).
     Rename { id: String, label: String },
     Mount { id: String },
@@ -69,6 +81,8 @@ pub enum Response {
     Mounted { id: String, mountpoint: String },
     Tested { summary: String },
     Shares { shares: Vec<String> },
+    /// A drive's saved settings, for the editor. No secret is included.
+    Described { remote: RemoteConfig },
     Update { status: UpdateStatus },
     FuseT { installed: bool, version: Option<String>, detail: String },
     /// `detail` is the registration itself (plist path / Run value), so the

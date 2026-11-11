@@ -181,6 +181,8 @@ struct App {
     status_call: Option<Pending<Vec<RemoteStatus>>>,
     action_call: Option<Pending<String>>,
     update_call: Option<Pending<UpdateStatus>>,
+    /// "편집"을 누르면 그 드라이브의 저장된 설정을 받아 폼을 채웁니다.
+    edit_call: Option<Pending<RemoteConfig>>,
     next_refresh: Instant,
 
     update: Option<UpdateStatus>,
@@ -261,6 +263,59 @@ struct Form {
     insecure_tls: bool,
     /// 포트를 직접 고쳤는지. 그렇지 않으면 종류와 보안 설정을 따라갑니다.
     port_edited: bool,
+    /// 이미 있는 드라이브를 고치는 중. 드라이브 이름(id)은 설정 키·키체인
+    /// 계정이라 잠그고, 비밀번호를 비워 두면 저장된 것을 그대로 씁니다.
+    editing: bool,
+}
+
+impl Form {
+    /// 저장된 드라이브를 고치려고 폼에 그대로 펼쳐 놓습니다.
+    ///
+    /// 잘못 넣은 주소·공유·계정 하나 때문에 드라이브를 지우고 처음부터 다시
+    /// 넣는 일이 없도록. 모든 칸은 "사용자가 손댄 것"으로 표시해 두어, 호스트를
+    /// 고쳐도 이름과 폴더가 멋대로 따라 바뀌지 않습니다.
+    fn from_remote(cfg: &RemoteConfig) -> Form {
+        let mut form = Form {
+            id: cfg.id.clone(),
+            name: cfg.label.clone(),
+            automount: cfg.automount,
+            readonly: cfg.readonly,
+            drive: cfg.drive.clone().unwrap_or_default(),
+            mountpoint: cfg.mountpoint.clone().unwrap_or_default(),
+            id_edited: true,
+            name_edited: true,
+            mountpoint_edited: true,
+            port_edited: true,
+            editing: true,
+            ..Form::default()
+        };
+        match &cfg.backend {
+            BackendConfig::Smb(smb) => {
+                form.kind = DriveKind::Smb;
+                form.host = smb.host.clone();
+                form.port = smb.port.to_string();
+                form.share = smb.share.clone();
+                form.user = smb.user.clone();
+                form.subpath = smb.subpath.clone().unwrap_or_default();
+            }
+            BackendConfig::Ftp(ftp) => {
+                form.kind = DriveKind::Ftp;
+                form.host = ftp.host.clone();
+                form.port = ftp.port.to_string();
+                form.user = ftp.user.clone();
+                form.subpath = ftp.subpath.clone().unwrap_or_default();
+                form.security = ftp.security.clone();
+                form.mode = ftp.mode.clone();
+                form.nat_workaround = ftp.passive_nat_workaround;
+                form.active_timeout = ftp.active_timeout_secs.to_string();
+                form.insecure_tls = ftp.accept_invalid_certs;
+            }
+            BackendConfig::Mem(_) => {}
+        }
+        // 고급 칸에 값이 있으면 펼쳐서 보여 줍니다 - 숨긴 채로는 고칠 수 없습니다.
+        form.advanced = !form.subpath.is_empty() || form.readonly || !form.automount;
+        form
+    }
 }
 
 impl Default for Form {
@@ -293,6 +348,7 @@ impl Default for Form {
             active_timeout: "10".into(),
             insecure_tls: false,
             port_edited: false,
+            editing: false,
         }
     }
 }
@@ -342,28 +398,22 @@ impl Form {
                 mydrives_core::naming::unique_id(&base, taken_ids)
             };
         }
-        if !self.name_edited {
-            let backend = self.to_remote().backend;
-            self.name = mydrives_core::naming::unique_label(
-                &mydrives_core::naming::product_name(&backend),
-                &share,
-                taken,
-            );
-        }
+        // 마운트 폴더는 드라이브 이름(id)을 그대로 씁니다. 공유 이름을 받기
+        // 전에는 비워 둡니다 - ".../MyDrives/drive" 같은 자리표시 경로가
+        // 진짜 값처럼 보입니다.
+        let _ = taken;
         if !self.mountpoint_edited && !cfg!(windows) {
-            // 폴더는 드라이브의 **이름**을 따릅니다. Finder 사이드바와 "컴퓨터"
-            // 보기가 폴더 이름을 그대로 보여 주므로, 사용자가 읽는 이름은
-            // 하나여야 합니다. 공유 이름을 받기 전에는 비워 둡니다 -
-            // ".../MyDrives/drive" 같은 자리표시 경로는 진짜 값처럼 보입니다.
-            let folder = if self.name.trim().is_empty() {
-                self.id.trim()
-            } else {
-                self.name.trim()
+            self.mountpoint = match self.id.trim() {
+                "" => String::new(),
+                name => format!("{}/MyDrives/{name}", self.home),
             };
-            self.mountpoint = match (self.id.trim(), folder) {
-                ("", _) | (_, "") => String::new(),
-                (_, folder) => format!("{}/MyDrives/{}", self.home, folder.replace('/', "-")),
-            };
+        }
+        if !self.name_edited {
+            // 화면에 보이는 이름은 **마운트 폴더 이름**을 기본값으로 합니다 -
+            // Finder 사이드바와 "컴퓨터" 보기가 그 폴더 이름을 보여 주므로,
+            // 둘이 같으면 어느 것이 어느 드라이브인지 헷갈리지 않습니다.
+            // 사용자가 다른 이름으로 고치면 그때부터 따라가지 않습니다.
+            self.name = self.id.trim().to_string();
         }
     }
 
@@ -543,6 +593,7 @@ impl App {
             status_call: None,
             action_call: None,
             update_call: None,
+            edit_call: None,
             next_refresh: Instant::now(),
             update: None,
             message: None,
@@ -644,6 +695,21 @@ impl App {
                 Ok(Err(_)) => self.update_call = None,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(_) => self.update_call = None,
+            }
+        }
+        if let Some(call) = &self.edit_call {
+            match call.rx.try_recv() {
+                Ok(Ok(remote)) => {
+                    self.selected = Some(remote.id.clone());
+                    self.view = View::Add(Box::new(Form::from_remote(&remote)));
+                    self.edit_call = None;
+                }
+                Ok(Err(e)) => {
+                    self.message = Some((format!("편집: {e}"), true));
+                    self.edit_call = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(_) => self.edit_call = None,
             }
         }
         if let Some(call) = &self.action_call {
@@ -1017,6 +1083,21 @@ impl App {
                 self.start_action("연결", Request::Mount { id: r.id.clone() });
             }
 
+            // 잘못 넣은 주소·공유·계정·비밀번호를 지우고 다시 넣지 않고 고칠 수
+            // 있게. 설정을 바꾸려면 마운트가 풀려 있어야 하므로 연결 중에는
+            // 끕니다.
+            let can_edit = !r.state.is_live() && !busy && self.edit_call.is_none();
+            if secondary(ui, p, "편집", can_edit).clicked() {
+                self.edit_call = Some(self.send(
+                    "편집",
+                    Request::Describe { id: r.id.clone() },
+                    |resp| match resp {
+                        Response::Described { remote } => Ok(remote),
+                        other => Err(format!("예상 밖의 응답: {other:?}")),
+                    },
+                ));
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let can_remove = !r.state.is_live() && !busy;
                 let remove = egui::Button::new(RichText::new("드라이브 삭제").color(p.err))
@@ -1082,28 +1163,43 @@ impl App {
 impl App {
     /// 폼을 그리고, 계속 열어 둘 경우 그대로 돌려줍니다(닫으면 `None`).
     fn draw_form(&mut self, ui: &mut egui::Ui, p: &Palette, mut form: Form) -> Option<Form> {
-        ui.label(RichText::new("새 드라이브").size(20.0).strong().color(p.text));
+        let title = if form.editing { "드라이브 편집" } else { "새 드라이브" };
+        ui.label(RichText::new(title).size(20.0).strong().color(p.text));
         ui.add_space(2.0);
-        ui.label(RichText::new(form.kind.blurb()).color(p.dim));
+        if form.editing {
+            ui.label(
+                RichText::new(format!(
+                    "'{}' 드라이브의 설정을 고칩니다. 비밀번호는 바꿀 때만 적으세요",
+                    form.id
+                ))
+                .color(p.dim),
+            );
+        } else {
+            ui.label(RichText::new(form.kind.blurb()).color(p.dim));
+        }
         ui.add_space(12.0);
 
         let mut keep = true;
         let mut source_changed = false;
 
-        // 종류를 먼저 고릅니다: 아래 칸들이 여기에 따라 달라집니다.
-        ui.horizontal(|ui| {
-            for kind in [DriveKind::Smb, DriveKind::Ftp] {
-                if ui
-                    .selectable_label(form.kind == kind, RichText::new(kind.label()))
-                    .clicked()
-                    && form.kind != kind
-                {
-                    form.kind = kind;
-                    source_changed = true;
+        // 종류를 먼저 고릅니다: 아래 칸들이 여기에 따라 달라집니다. 있는
+        // 드라이브의 종류를 바꾸는 것은 다른 드라이브를 만드는 일이라 편집에서는
+        // 잠급니다.
+        if !form.editing {
+            ui.horizontal(|ui| {
+                for kind in [DriveKind::Smb, DriveKind::Ftp] {
+                    if ui
+                        .selectable_label(form.kind == kind, RichText::new(kind.label()))
+                        .clicked()
+                        && form.kind != kind
+                    {
+                        form.kind = kind;
+                        source_changed = true;
+                    }
                 }
-            }
-        });
-        ui.add_space(10.0);
+            });
+            ui.add_space(10.0);
+        }
         // 이름이 이미 쓰이고 있는지 보려면 지금 있는 드라이브들의 이름이 필요합니다.
         // 보이는 이름(label)과 드라이브 이름(id)은 쓰임이 달라 따로 봅니다 —
         // id가 겹치면 기존 드라이브를 덮어쓰기 때문입니다.
@@ -1266,9 +1362,11 @@ impl App {
                         );
                     });
                     field(ui, p, "비밀번호", |ui| {
+                        let hint = if form.editing { "비워 두면 저장된 비밀번호 유지" } else { "" };
                         ui.add(
                             egui::TextEdit::singleline(&mut form.password)
                                 .password(true)
+                                .hint_text(hint)
                                 .desired_width(260.0),
                         );
                     });
@@ -1319,7 +1417,10 @@ impl App {
                     .spacing([14.0, 10.0])
                     .show(ui, |ui| {
                         field(ui, p, "드라이브 이름", |ui| {
-                            let r = ui.add(
+                            // 설정 키이자 키체인 계정이라, 있는 드라이브에서는
+                            // 바꿀 수 없습니다(바꾸면 다른 드라이브가 됩니다).
+                            let r = ui.add_enabled(
+                                !form.editing,
                                 egui::TextEdit::singleline(&mut form.id)
                                     .hint_text("마운트 폴더 이름이 됩니다")
                                     .desired_width(260.0),
@@ -1367,14 +1468,23 @@ impl App {
         ui.add_space(18.0);
         let busy = self.action_call.is_some();
         ui.horizontal(|ui| {
-            if primary(ui, p, "저장하고 연결", !busy).clicked() {
+            let save_label = if form.editing { "저장하고 다시 연결" } else { "저장하고 연결" };
+            if primary(ui, p, save_label, !busy).clicked() {
                 match form.validate() {
                     Ok(()) => {
+                        // 편집에서 비밀번호 칸을 비워 두면 저장된 것을 그대로
+                        // 둡니다(None). 새 드라이브는 빈 값도 그대로 보냅니다.
+                        let secret = if form.editing && form.password.is_empty() {
+                            None
+                        } else {
+                            Some(form.password.clone())
+                        };
                         self.start_action(
                             "저장",
                             Request::Add {
                                 remote: form.to_remote(),
-                                secret: Some(form.password.clone()),
+                                secret,
+                                replace: form.editing,
                             },
                         );
                         self.pending_mount = Some(form.id.trim().to_string());
@@ -1653,7 +1763,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_path_follows_the_share_and_the_name_follows_the_nas() {
+    fn the_name_and_the_folder_both_default_to_the_share() {
         let mut form = Form {
             home: "/Users/x".into(),
             ..Form::default()
@@ -1662,30 +1772,28 @@ mod tests {
         form.share = "Public".into();
         form.follow_sources(&[], &[]);
 
-        // 드라이브 이름(id)은 공유 폴더를, 표시 이름과 폴더는 장비를 따릅니다.
-        // Finder가 보여 주는 것은 폴더 이름이므로 표시 이름과 같아야 합니다.
+        // 드라이브 이름(id), 마운트 폴더, 화면에 보이는 이름이 모두 공유 폴더
+        // 이름을 기본값으로 합니다. Finder가 보여 주는 것이 폴더 이름이므로
+        // 표시 이름이 그와 같아야 헷갈리지 않습니다.
         assert_eq!(form.id, "Public");
-        assert_eq!(form.name, "turtlelab");
+        assert_eq!(form.name, "Public");
         if !cfg!(windows) {
-            assert_eq!(form.mountpoint, "/Users/x/MyDrives/turtlelab");
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/Public");
         }
 
-        // 같은 NAS의 두 번째 공유는 이름이 겹치지 않게 공유 이름이 붙습니다.
-        form.follow_sources(&["turtlelab".to_string()], &[]);
-        assert_eq!(form.name, "turtlelab (Public)");
-        if !cfg!(windows) {
-            assert_eq!(form.mountpoint, "/Users/x/MyDrives/turtlelab (Public)");
-        }
-
-        // 사용자가 직접 고친 칸은 따라가지 않습니다.
-        form.id = "nas".into();
-        form.id_edited = true;
-        form.name = "거북이".into();
+        // 이름을 다른 것으로 고치면 그때부터는 따라가지 않습니다 - 폴더는
+        // 그대로 두고 표시 이름만 바뀝니다.
+        form.name = "거북이 NAS".into();
         form.name_edited = true;
         form.share = "Other".into();
+        form.id_edited = false;
+        form.mountpoint_edited = false;
         form.follow_sources(&[], &[]);
-        assert_eq!(form.id, "nas");
-        assert_eq!(form.name, "거북이");
+        assert_eq!(form.id, "Other");
+        assert_eq!(form.name, "거북이 NAS");
+        if !cfg!(windows) {
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/Other");
+        }
     }
 
     #[test]
@@ -1700,7 +1808,7 @@ mod tests {
         form.follow_sources(&[], &[]);
 
         assert_eq!(form.id, "public_html");
-        assert_eq!(form.name, "files");
+        assert_eq!(form.name, "public_html");
         // 명시적 FTPS는 평문과 같은 포트에서 시작합니다.
         assert_eq!(form.port, "21");
 
@@ -1759,7 +1867,7 @@ mod tests {
         // 드라이브 이름과 마운트 경로에 슬래시가 섞이지 않습니다.
         assert_eq!(form.id, "jazzlife");
         if !cfg!(windows) {
-            assert_eq!(form.mountpoint, "/Users/x/MyDrives/turtlelab");
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/jazzlife");
         }
 
         match form.to_remote().backend {
@@ -1824,7 +1932,7 @@ mod tests {
         // 드라이브 이름과 마운트 폴더는 들어가는 폴더를 따릅니다.
         assert_eq!(form.id, "Study");
         if !cfg!(windows) {
-            assert_eq!(form.mountpoint, "/Users/x/MyDrives/turtlelab");
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/Study");
         }
         match form.to_remote().backend {
             BackendConfig::Smb(smb) => {
@@ -1844,7 +1952,7 @@ mod tests {
         form.host = "turtlelab.ddns.net".into();
         form.share = "jazzlife".into();
         form.follow_sources(&[], &[]);
-        assert_eq!(form.name, "turtlelab");
+        assert_eq!(form.name, "jazzlife");
 
         // 사용자가 이름을 지웠다 (= changed 이벤트, 값은 빈 문자열).
         form.name.clear();
@@ -1880,7 +1988,7 @@ mod tests {
         form.follow_sources(&[], &["jazzlife".to_string()]);
         assert_eq!(form.id, "jazzlife-2");
         if !cfg!(windows) {
-            assert_eq!(form.mountpoint, "/Users/x/MyDrives/turtlelab");
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/jazzlife-2");
         }
 
         form.follow_sources(&[], &["jazzlife".to_string(), "jazzlife-2".to_string()]);

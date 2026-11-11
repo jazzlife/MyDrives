@@ -274,7 +274,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Add { kind } => {
             let (remote, secret, mount_now) = build_remote(kind)?;
             let id = remote.id.clone();
-            let res = send(&Request::Add { remote, secret }, cli.json).await?;
+            let res = send(
+                &Request::Add {
+                    remote,
+                    secret,
+                    replace: false,
+                },
+                cli.json,
+            )
+            .await?;
             if let Response::Ok = res {
                 if !cli.json {
                     println!("added {id}");
