@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MyDrives 개인정보처리방침</title>
+<style>
+ :root { color-scheme: light dark; }
+ body { max-width: 42rem; margin: 3rem auto; padding: 0 1.2rem;
+        font: 16px/1.7 -apple-system, "Segoe UI", system-ui, sans-serif; }
+ h1 { font-size: 1.7rem; } h2 { font-size: 1.15rem; margin-top: 2rem; }
+ .sub { opacity: .7; margin-top: 0; }
+ ul { padding-left: 1.2rem; }
+ footer { margin-top: 3rem; font-size: .9rem; opacity: .7; }
+ a { color: inherit; }
+</style>
+</head>
+<body>
+<h1>개인정보처리방침</h1>
+<p class="sub">MyDrives · 최종 수정 2026년 11월 11일</p>
+
+<h2>요약</h2>
+<p>MyDrives는 사용자의 컴퓨터에서만 실행되는 데스크톱 앱입니다. 개발자가 운영하는
+서버가 없으며, 사용자의 파일이나 계정 정보가 개발자에게 전송되거나 수집되는 일은
+없습니다.</p>
+
+<h2>처리하는 정보</h2>
+<ul>
+  <li><strong>저장소 접근 토큰</strong> — 사용자가 Google, Microsoft, Dropbox,
+      네이버 MYBOX에 로그인하면 해당 서비스가 발급한 토큰을 운영체제의 자격증명
+      저장소(macOS 키체인, Windows 자격 증명 관리자)에 저장합니다. 설정 파일이나
+      로그에는 남기지 않습니다.</li>
+  <li><strong>파일과 폴더</strong> — 사용자가 드라이브를 열거나 파일을 읽고 쓸 때,
+      해당 서비스의 공개 API로 그 작업만 수행합니다. 목록과 파일 내용 일부는 속도를
+      위해 사용자의 컴퓨터 메모리와 임시 파일에 잠시 보관되며, 파일을 닫거나 앱을
+      종료하면 지워집니다.</li>
+  <li><strong>연결 설정</strong> — 주소, 공유 폴더 이름, 마운트 경로 같은 설정은
+      사용자의 컴퓨터에 있는 설정 파일에만 저장됩니다.</li>
+</ul>
+
+<h2>전송하지 않는 것</h2>
+<p>MyDrives는 분석·추적·광고 도구를 포함하지 않습니다. 파일 내용, 파일 이름,
+토큰, 사용 기록을 개발자나 제3자에게 보내지 않습니다. 네트워크 통신은 사용자가
+등록한 저장소 서비스와, 업데이트 확인을 위한 GitHub 릴리스 API에 한정됩니다.</p>
+
+<h2>Google 사용자 데이터</h2>
+<p>MyDrives는 Google Drive를 드라이브로 연결하기 위해
+<code>https://www.googleapis.com/auth/drive</code> 범위를 요청합니다. 이 권한은
+사용자가 파일 탐색기에서 수행한 동작(목록 보기, 열기, 저장, 이름 변경, 이동,
+삭제)을 그대로 Drive에 반영하는 데에만 쓰입니다.</p>
+<p>MyDrives가 Google API로부터 받은 정보의 사용과 다른 앱으로의 전송은
+<a href="https://developers.google.com/terms/api-services-user-data-policy">Google API 서비스 사용자 데이터 정책</a>을
+따르며, 여기에는 제한된 사용(Limited Use) 요건이 포함됩니다. 구체적으로 MyDrives는
+Google 사용자 데이터를 광고 목적으로 사용하거나, 판매하거나, 사람이 읽도록 제공하지
+않습니다.</p>
+
+<h2>접근 권한 철회</h2>
+<p>드라이브를 삭제하면 저장된 토큰도 함께 지워집니다. 서비스 쪽에서 직접 철회하려면
+<a href="https://myaccount.google.com/permissions">Google 계정 권한 페이지</a>,
+Microsoft 계정의 앱 권한, Dropbox 연결된 앱 설정, MYBOX 토큰 관리 화면을
+이용하세요.</p>
+
+<h2>변경</h2>
+<p>이 방침이 바뀌면 이 페이지의 날짜가 갱신되고, 변경 내역은 GitHub 저장소의 커밋
+기록에 남습니다.</p>
+
+<footer>문의: jazzlife.dev@gmail.com ·
+<a href="https://github.com/jazzlife/MyDrives">github.com/jazzlife/MyDrives</a> ·
+<a href="index.html">홈</a></footer>
+</body>
+</html>
