@@ -33,6 +33,7 @@ pub mod inode;
 pub mod manager;
 pub mod mount;
 pub mod naming;
+pub mod oauth;
 pub mod path;
 pub mod secret;
 pub mod types;

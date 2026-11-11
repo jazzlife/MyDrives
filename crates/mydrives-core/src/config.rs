@@ -151,10 +151,10 @@ pub enum BackendConfig {
     Smb(SmbConfig),
     Ftp(FtpConfig),
     Mybox(MyboxConfig),
+    Gdrive(OAuthConfig),
     Mem(MemConfig),
     // Planned, deliberately not stubbed as half-working backends:
-    //   Gdrive(OAuthConfig), Onedrive(OAuthConfig), Dropbox(OAuthConfig),
-    //   Webdav(WebdavConfig)
+    //   Onedrive(OAuthConfig), Dropbox(OAuthConfig), Webdav(WebdavConfig)
 }
 
 impl BackendConfig {
@@ -163,9 +163,29 @@ impl BackendConfig {
             BackendConfig::Smb(_) => "smb",
             BackendConfig::Ftp(_) => "ftp",
             BackendConfig::Mybox(_) => "mybox",
+            BackendConfig::Gdrive(_) => "gdrive",
             BackendConfig::Mem(_) => "mem",
         }
     }
+}
+
+/// A service signed into with OAuth as a desktop app: Google Drive, and
+/// after it OneDrive and Dropbox. The user registers the app with the
+/// service and brings the client id; the tokens the sign-in produces are
+/// the drive's secret, kept where a password would be.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OAuthConfig {
+    pub client_id: String,
+    /// Google hands one out even to desktop apps and accepts it; the others
+    /// do not have one for this kind of client.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Folder inside the account to expose as the mount root; the whole
+    /// account when absent.
+    #[serde(default)]
+    pub subpath: Option<String>,
+    #[serde(default)]
+    pub secret: SecretRef,
 }
 
 /// 네이버 MYBOX over its Open API. The only credential is a personal access

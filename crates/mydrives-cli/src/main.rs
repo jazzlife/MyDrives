@@ -8,7 +8,7 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 
 use mydrives_core::config::{
-    BackendConfig, FtpConfig, MemConfig, MyboxConfig, RemoteConfig, SecretRef, SmbConfig,
+    BackendConfig, FtpConfig, MemConfig, MyboxConfig, OAuthConfig, RemoteConfig, SecretRef, SmbConfig,
 };
 use mydrives_core::manager::MountState;
 use mydrives_ipc::{Request, Response};
@@ -221,6 +221,43 @@ enum AddKind {
         #[arg(long)]
         mount: bool,
     },
+    /// Google Drive, signed into in the browser with your own OAuth client
+    /// (Google Cloud console → APIs & Services → Credentials → OAuth client ID,
+    /// type "Desktop app").
+    Gdrive {
+        /// Drive name. Defaults to the folder mounted, or `GoogleDrive`.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        /// The OAuth client ID (`…apps.googleusercontent.com`).
+        #[arg(long)]
+        client_id: String,
+        /// The client secret Google shows next to it (optional for desktop apps).
+        #[arg(long)]
+        client_secret: Option<String>,
+        /// Open the browser to sign in now. The tokens go to the OS keychain.
+        #[arg(long)]
+        login: bool,
+        /// Only one folder of the drive, e.g. `/Work`.
+        #[arg(long)]
+        subpath: Option<String>,
+        /// Windows drive letter, e.g. `Z:`.
+        #[arg(long)]
+        drive: Option<String>,
+        /// Directory to mount on (macOS/Linux).
+        #[arg(long)]
+        mountpoint: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        readonly: bool,
+        #[arg(long)]
+        no_automount: bool,
+        /// Mount it right away.
+        #[arg(long)]
+        mount: bool,
+    },
     /// An in-memory test volume, for checking that mounting works at all.
     Mem {
         #[arg(long)]
@@ -304,7 +341,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Command::Add { kind } => {
-            let (remote, secret, mount_now) = build_remote(kind)?;
+            let (remote, secret, mount_now) = build_remote(kind).await?;
             let id = remote.id.clone();
             let res = send(
                 &Request::Add {
@@ -328,7 +365,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Command::Test { kind } => {
-            let (remote, secret, _) = build_remote(kind)?;
+            let (remote, secret, _) = build_remote(kind).await?;
             let res = send(&Request::Test { remote, secret }, cli.json).await?;
             if let Response::Tested { summary } = res {
                 println!("{summary}");
@@ -512,7 +549,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<String>, bool)> {
+async fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<String>, bool)> {
     match kind {
         AddKind::Smb {
             id,
@@ -679,6 +716,55 @@ fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<String>, 
                     id,
                 },
                 secret,
+                mount,
+            ))
+        }
+        AddKind::Gdrive {
+            id,
+            label,
+            client_id,
+            client_secret,
+            login,
+            subpath,
+            drive,
+            mountpoint,
+            provider,
+            readonly,
+            no_automount,
+            mount,
+        } => {
+            if !login {
+                anyhow::bail!("Google 로그인이 필요합니다: `--login` 을 붙이면 브라우저가 열립니다");
+            }
+            let oauth = mydrives_core::oauth::google_provider(&client_id, client_secret.as_deref());
+            eprintln!("브라우저에서 Google 계정으로 로그인하세요…");
+            let tokens = mydrives_core::oauth::authorize(
+                &oauth,
+                std::time::Duration::from_secs(300),
+                mydrives_core::oauth::open_in_browser,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let id = id.unwrap_or_else(|| {
+                mydrives_core::naming::cloud_default_id("GoogleDrive", subpath.as_deref())
+            });
+            Ok((
+                RemoteConfig {
+                    label: label.unwrap_or_default(),
+                    automount: !no_automount,
+                    readonly,
+                    provider,
+                    drive,
+                    mountpoint,
+                    backend: BackendConfig::Gdrive(OAuthConfig {
+                        client_id,
+                        client_secret,
+                        subpath,
+                        secret: SecretRef::Keychain,
+                    }),
+                    id,
+                },
+                Some(tokens.to_json()),
                 mount,
             ))
         }

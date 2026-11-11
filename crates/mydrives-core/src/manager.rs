@@ -660,6 +660,9 @@ fn describe_config(cfg: &RemoteConfig) -> String {
         crate::config::BackendConfig::Mybox(m) => {
             format!("mybox://{}", m.subpath.as_deref().unwrap_or("/"))
         }
+        crate::config::BackendConfig::Gdrive(g) => {
+            format!("gdrive://{}", g.subpath.as_deref().unwrap_or("/"))
+        }
         crate::config::BackendConfig::Mem(_) => "mem://".to_string(),
     }
 }

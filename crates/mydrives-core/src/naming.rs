@@ -28,9 +28,9 @@ pub fn product_name(backend: &BackendConfig) -> String {
         // A cloud service is its own product; the folder inside it is what
         // the id says.
         BackendConfig::Mybox(_) => "네이버 MYBOX".to_string(),
+        BackendConfig::Gdrive(_) => "Google Drive".to_string(),
         BackendConfig::Mem(_) => "테스트 볼륨".to_string(),
         // Planned backends name themselves after the service, not the folder:
-        //   Gdrive(_)   => "Google Drive"
         //   Onedrive(_) => "OneDrive"
         //   Dropbox(_)  => "Dropbox"
     }
@@ -133,6 +133,7 @@ pub fn same_target(a: &BackendConfig, b: &BackendConfig) -> bool {
         }
         // One account per token; two MYBOX drives differ only by folder.
         (BackendConfig::Mybox(x), BackendConfig::Mybox(y)) => x.subpath == y.subpath,
+        (BackendConfig::Gdrive(x), BackendConfig::Gdrive(y)) => x.subpath == y.subpath,
         (BackendConfig::Mem(_), BackendConfig::Mem(_)) => true,
         _ => false,
     }
@@ -178,6 +179,7 @@ pub fn is_generated_label(label: &str, backend: &BackendConfig) -> bool {
         // shape to recognise is the bare host the first version wrote.
         BackendConfig::Ftp(ftp) => label == ftp.host,
         BackendConfig::Mybox(_) => label == "네이버 MYBOX",
+        BackendConfig::Gdrive(_) => label == "Google Drive",
         BackendConfig::Mem(_) => label == "in-memory test volume",
     }
 }

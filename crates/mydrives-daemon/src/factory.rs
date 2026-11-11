@@ -117,6 +117,34 @@ impl BackendFactory for Factory {
                     mybox.subpath.clone(),
                 ))
             }
+            BackendConfig::Gdrive(oauth) => {
+                let stored = load_secret(&cfg.id, &oauth.secret)?.unwrap_or_default();
+                if stored.trim().is_empty() {
+                    return Err(Error::AuthFailed(format!(
+                        "'{}'은 아직 Google에 로그인하지 않았습니다 - 드라이브 편집에서 로그인하세요",
+                        cfg.id
+                    )));
+                }
+                let tokens = mydrives_core::oauth::TokenSet::from_json(&stored)?;
+                let provider = mydrives_backend_cloud::gdrive::provider(
+                    &oauth.client_id,
+                    oauth.client_secret.as_deref(),
+                );
+                // A refreshed token set goes back where the old one was, so
+                // the next start does not have to refresh again - and so a
+                // Google refresh token rotation is not lost.
+                let id = cfg.id.clone();
+                let session = mydrives_core::oauth::Session::new(provider, tokens, move |t| {
+                    if let Err(e) = secret::store(&id, &t.to_json()) {
+                        tracing::warn!(remote = %id, error = %e, "갱신된 로그인 정보를 저장하지 못했습니다");
+                    }
+                });
+                Ok(mydrives_backend_cloud::gdrive::backend(
+                    cfg.id.clone(),
+                    session,
+                    oauth.subpath.clone(),
+                ))
+            }
             BackendConfig::Mem(mem) => Ok(Arc::new(if mem.fixture {
                 fixture(&cfg.id)
             } else {

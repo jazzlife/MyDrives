@@ -429,3 +429,36 @@ MYBOX, Google Drive, OneDrive, Dropbox는 파일시스템 입장에서 같은 �
 실제 계정에서의 확인(특히 업로드 URL의 응답, 다운로드 URL의 Range 지원 여부)은
 사용자 토큰이 있어야 합니다. Range가 된다면 `range_reads=true`로 바꾸어 큰 파일을
 통째로 받지 않게 할 수 있습니다.
+
+## 12. Google Drive + 데스크톱 OAuth (2026-11-11)
+
+**로그인**은 RFC 8252의 네이티브 앱 방식입니다: PKCE(S256) + 이 프로세스가 잠깐 여는
+`http://127.0.0.1:<임의 포트>` 루프백으로 되돌아오기. 구현은 `mydrives-core::oauth`에
+있어 창(UI), CLI, 에이전트가 같은 코드를 씁니다. 결과는 `TokenSet`(access·refresh·
+만료 시각) JSON이고, 드라이브의 비밀번호 자리(키체인)에 저장됩니다. `Session`이
+만료 1분 전에 refresh 토큰으로 갱신하고 새 세트를 다시 저장합니다(갱신 응답이
+refresh 토큰을 빼먹으면 이전 것을 유지). 401이 오면 한 번 강제 갱신 후 재시도하고,
+그래도 안 되면 "드라이브 편집에서 다시 로그인" 메시지입니다.
+
+**클라이언트 ID는 사용자 것**입니다. 오픈소스 바이너리에 앱 하나의 ID를 박으면 누구나
+그 앱 행세를 할 수 있어 넣지 않았습니다. Google Cloud 콘솔 → API 및 서비스 → 사용자
+인증 정보 → OAuth 클라이언트 ID(데스크톱 앱)를 만들고 Drive API를 켜면 됩니다.
+Google은 데스크톱 앱에도 시크릿을 주고 보내면 받으므로 선택 입력입니다.
+범위는 `…/auth/drive`(드라이브 전체) 하나 — 앱이 만든 파일만 보이는 `drive.file`로는
+기존 파일을 마운트할 수 없습니다.
+
+**Drive API v3** (문서 2026-11-11 확인): 목록 `GET /drive/v3/files?q='<id>' in parents
+and trashed = false&fields=…&pageSize=1000&pageToken`, 폴더 `mimeType =
+application/vnd.google-apps.folder`, 루트 id `root`. 다운로드 `GET /files/{id}?alt=media`
+는 `Range`를 받아 **로컬 복사본 없이 조각 읽기**를 합니다(`range_reads=true`). 업로드는
+재개형 세션 한 번: 새 파일은 `POST /upload/drive/v3/files?uploadType=resumable`
+(이름·부모), 있는 파일은 `PATCH /upload/…/files/{id}?uploadType=resumable`, 둘 다
+`Location`의 세션 URI에 `PUT` 한 번. 삭제는 `trashed=true`(휴지통), 이동은 `PATCH ?
+addParents=&removeParents=`, 이름 변경은 `PATCH {name}`, 용량은 `about?fields=
+storageQuota`(문자열 int64, limit 없으면 무제한). Google 문서·시트·슬라이드는 바이트가
+없어(내보내기만 가능) 목록에서 뺍니다. 같은 폴더에 같은 이름이 여럿일 수 있는데, 이
+계층은 첫 번째 것을 씁니다.
+
+검증: OAuth 흐름은 가짜 브라우저(루프백에 직접 요청)와 모의 토큰 서버로 왕복까지,
+Drive 요청 모양은 모의 서버로 시험했습니다. 실제 계정 확인은 사용자의 클라이언트 ID가
+있어야 합니다.

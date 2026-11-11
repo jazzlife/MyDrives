@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use egui::{Align2, Color32, CornerRadius, FontId, Margin, RichText, Sense, Stroke, Vec2};
 
 use mydrives_core::config::{
-    BackendConfig, FtpConfig, MyboxConfig, RemoteConfig, SecretRef, SmbConfig,
+    BackendConfig, FtpConfig, MyboxConfig, OAuthConfig, RemoteConfig, SecretRef, SmbConfig,
 };
 use mydrives_core::manager::{MountState, RemoteStatus};
 use mydrives_core::update::{UpdateState, UpdateStatus};
@@ -185,6 +185,8 @@ struct App {
     update_call: Option<Pending<UpdateStatus>>,
     /// "편집"을 누르면 그 드라이브의 저장된 설정을 받아 폼을 채웁니다.
     edit_call: Option<Pending<RemoteConfig>>,
+    /// 브라우저 로그인이 진행 중이면 그 결과(토큰 JSON)를 기다립니다.
+    login_call: Option<Pending<String>>,
     next_refresh: Instant,
 
     update: Option<UpdateStatus>,
@@ -212,6 +214,7 @@ enum DriveKind {
     Smb,
     Ftp,
     Mybox,
+    Gdrive,
 }
 
 impl DriveKind {
@@ -220,6 +223,7 @@ impl DriveKind {
             DriveKind::Smb => "NAS (SMB)",
             DriveKind::Ftp => "FTP",
             DriveKind::Mybox => "네이버 MYBOX",
+            DriveKind::Gdrive => "Google Drive",
         }
     }
 
@@ -230,15 +234,23 @@ impl DriveKind {
             DriveKind::Mybox => {
                 "네이버 MYBOX를 드라이브로 연결합니다. MYBOX 웹 설정 → 계정 및 개인 액세스 토큰 관리에서 만든 토큰이 필요합니다"
             }
+            DriveKind::Gdrive => {
+                "Google Drive를 드라이브로 연결합니다. Google Cloud 콘솔에서 만든 OAuth 클라이언트(데스크톱 앱) ID로 로그인합니다"
+            }
         }
     }
 
     /// A service with an account and a token, not a server with an address.
     fn is_cloud(self) -> bool {
-        matches!(self, DriveKind::Mybox)
+        matches!(self, DriveKind::Mybox | DriveKind::Gdrive)
     }
 
-    const ALL: [DriveKind; 3] = [DriveKind::Smb, DriveKind::Ftp, DriveKind::Mybox];
+    /// Signs in through the browser rather than with a password or token.
+    fn uses_oauth(self) -> bool {
+        matches!(self, DriveKind::Gdrive)
+    }
+
+    const ALL: [DriveKind; 4] = [DriveKind::Smb, DriveKind::Ftp, DriveKind::Mybox, DriveKind::Gdrive];
 }
 
 /// 추가 폼. SMB(NAS)와 FTP를 받습니다.
@@ -280,6 +292,10 @@ struct Form {
     /// 이미 있는 드라이브를 고치는 중. 드라이브 이름(id)은 설정 키·키체인
     /// 계정이라 잠그고, 비밀번호를 비워 두면 저장된 것을 그대로 씁니다.
     editing: bool,
+    /// OAuth 서비스(Google Drive): 사용자가 서비스에 등록한 앱의 클라이언트 ID와,
+    /// 있다면 시크릿. 로그인 결과(토큰)는 `password` 칸에 JSON으로 들어갑니다.
+    client_id: String,
+    client_secret: String,
 }
 
 impl Form {
@@ -328,6 +344,12 @@ impl Form {
                 form.kind = DriveKind::Mybox;
                 form.subpath = mybox.subpath.clone().unwrap_or_default();
             }
+            BackendConfig::Gdrive(oauth) => {
+                form.kind = DriveKind::Gdrive;
+                form.subpath = oauth.subpath.clone().unwrap_or_default();
+                form.client_id = oauth.client_id.clone();
+                form.client_secret = oauth.client_secret.clone().unwrap_or_default();
+            }
             BackendConfig::Mem(_) => {}
         }
         // 고급 칸에 값이 있으면 펼쳐서 보여 줍니다 - 숨긴 채로는 고칠 수 없습니다.
@@ -367,6 +389,8 @@ impl Default for Form {
             insecure_tls: false,
             port_edited: false,
             editing: false,
+            client_id: String::new(),
+            client_secret: String::new(),
         }
     }
 }
@@ -395,7 +419,7 @@ impl Form {
                     .filter(|leaf| !leaf.is_empty())
                     .unwrap_or(share)
             }
-            DriveKind::Ftp | DriveKind::Mybox => self.subpath.trim().to_string(),
+            DriveKind::Ftp | DriveKind::Mybox | DriveKind::Gdrive => self.subpath.trim().to_string(),
         };
         if !self.port_edited {
             self.port = self.default_port().to_string();
@@ -408,6 +432,9 @@ impl Form {
                 }
                 DriveKind::Mybox => {
                     mydrives_core::naming::cloud_default_id("MYBOX", opt(&self.subpath).as_deref())
+                }
+                DriveKind::Gdrive => {
+                    mydrives_core::naming::cloud_default_id("GoogleDrive", opt(&self.subpath).as_deref())
                 }
             };
             // 이름이 겹치면 **기존 드라이브를 덮어씁니다** — id가 설정 키이자
@@ -446,7 +473,7 @@ impl Form {
             DriveKind::Ftp if self.security == "implicit" => 990,
             DriveKind::Ftp => 21,
             // HTTPS to the service; there is no port to choose.
-            DriveKind::Mybox => 443,
+            DriveKind::Mybox | DriveKind::Gdrive => 443,
         }
     }
 
@@ -458,10 +485,17 @@ impl Form {
             return Err("드라이브 이름을 입력하세요");
         }
         if self.kind.is_cloud() {
-            // The token is the whole credential. Editing may leave it blank
-            // to keep the stored one.
+            if self.kind.uses_oauth() && self.client_id.trim().is_empty() {
+                return Err("OAuth 클라이언트 ID를 입력하세요");
+            }
+            // The token (or the sign-in) is the whole credential. Editing may
+            // leave it blank to keep the stored one.
             if !self.editing && self.password.trim().is_empty() {
-                return Err("액세스 토큰을 입력하세요");
+                return Err(if self.kind.uses_oauth() {
+                    "먼저 로그인하세요"
+                } else {
+                    "액세스 토큰을 입력하세요"
+                });
             }
         } else {
             if self.host.trim().is_empty() {
@@ -534,6 +568,12 @@ impl Form {
                 DriveKind::Mybox => BackendConfig::Mybox(MyboxConfig {
                     subpath: clean_subpath(&self.subpath),
                     // The token goes to the keychain like a password does.
+                    secret: SecretRef::Keychain,
+                }),
+                DriveKind::Gdrive => BackendConfig::Gdrive(OAuthConfig {
+                    client_id: self.client_id.trim().to_string(),
+                    client_secret: opt(&self.client_secret),
+                    subpath: clean_subpath(&self.subpath),
                     secret: SecretRef::Keychain,
                 }),
             },
@@ -631,6 +671,7 @@ impl App {
             action_call: None,
             update_call: None,
             edit_call: None,
+            login_call: None,
             next_refresh: Instant::now(),
             update: None,
             message: None,
@@ -668,6 +709,39 @@ impl App {
             label: label.to_string(),
             rx,
         }
+    }
+
+    /// Signs into the form's OAuth service in the browser. The flow runs on
+    /// the window's runtime - it listens on a loopback port for the browser
+    /// to come back - and the result arrives through `login_call`.
+    fn start_login(&mut self, form: &Form) {
+        if self.login_call.is_some() {
+            return;
+        }
+        let provider = match form.kind {
+            DriveKind::Gdrive => mydrives_core::oauth::google_provider(
+                &form.client_id,
+                opt(&form.client_secret).as_deref(),
+            ),
+            _ => return,
+        };
+        self.message = None;
+        let (tx, rx) = channel();
+        self.rt.spawn(async move {
+            let result = mydrives_core::oauth::authorize(
+                &provider,
+                Duration::from_secs(300),
+                mydrives_core::oauth::open_in_browser,
+            )
+            .await
+            .map(|t| t.to_json())
+            .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.login_call = Some(Pending {
+            label: "로그인".to_string(),
+            rx,
+        });
     }
 
     fn refresh_status(&mut self) {
@@ -732,6 +806,25 @@ impl App {
                 Ok(Err(_)) => self.update_call = None,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(_) => self.update_call = None,
+            }
+        }
+        if let Some(call) = &self.login_call {
+            match call.rx.try_recv() {
+                Ok(Ok(tokens)) => {
+                    // The sign-in landed: the tokens become the drive's secret,
+                    // to be stored when the form is saved.
+                    if let View::Add(form) = &mut self.view {
+                        form.password = tokens;
+                    }
+                    self.message = Some(("로그인 완료 - 이제 저장하고 연결하세요".into(), false));
+                    self.login_call = None;
+                }
+                Ok(Err(e)) => {
+                    self.message = Some((format!("로그인: {e}"), true));
+                    self.login_call = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(_) => self.login_call = None,
             }
         }
         if let Some(call) = &self.edit_call {
@@ -1290,6 +1383,33 @@ impl App {
                             );
                             source_changed |= r.changed();
                         }),
+                        DriveKind::Gdrive => {
+                            // The app the user registered with Google: a Desktop
+                            // app client in their own Cloud project.
+                            field(ui, p, "클라이언트 ID", |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.client_id)
+                                        .hint_text("Google Cloud 콘솔의 OAuth 클라이언트 ID (…apps.googleusercontent.com)")
+                                        .desired_width(260.0),
+                                );
+                            });
+                            field(ui, p, "클라이언트 시크릿", |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.client_secret)
+                                        .password(true)
+                                        .hint_text("데스크톱 앱이면 있는 그대로 (선택)")
+                                        .desired_width(260.0),
+                                );
+                            });
+                            field(ui, p, "폴더", |ui| {
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(&mut form.subpath)
+                                        .hint_text("드라이브 전체를 쓰려면 비워 둠 (예: /Work)")
+                                        .desired_width(260.0),
+                                );
+                                source_changed |= r.changed();
+                            });
+                        }
                     }
                     // 포트는 어느 종류든 기본 칸에 둡니다. NAS는 공유 포트를
                     // 바꿔 쓰는 일이 흔한데, 이 칸이 "고급 설정" 뒤에 숨어 있으면
@@ -1411,9 +1531,34 @@ impl App {
                             );
                         });
                     }
+                    if form.kind.uses_oauth() {
+                        // The credential is a sign-in in the browser; the tokens it
+                        // leaves land in `password` as JSON and are stored like one.
+                        field(ui, p, "계정", |ui| {
+                            let busy = self.login_call.is_some();
+                            let can = !busy && !form.client_id.trim().is_empty();
+                            if secondary(ui, p, "Google 계정으로 로그인", can).clicked() {
+                                self.start_login(&form);
+                            }
+                            ui.add_space(8.0);
+                            let status = if busy {
+                                "브라우저에서 로그인을 마치세요…"
+                            } else if !form.password.is_empty() {
+                                "로그인됨"
+                            } else if form.editing {
+                                "저장된 로그인 유지 (바꾸려면 다시 로그인)"
+                            } else if form.client_id.trim().is_empty() {
+                                "클라이언트 ID를 먼저 적으세요"
+                            } else {
+                                "아직 로그인하지 않음"
+                            };
+                            ui.label(RichText::new(status).color(p.dim));
+                        });
+                    }
                     // A cloud service's credential is a token, and it is typed
                     // (pasted) into the same kind of box a password is.
                     let secret_label = if form.kind.is_cloud() { "액세스 토큰" } else { "비밀번호" };
+                    if !form.kind.uses_oauth() {
                     field(ui, p, secret_label, |ui| {
                         let hint = match (form.editing, form.kind.is_cloud()) {
                             (true, true) => "비워 두면 저장된 토큰 유지",
@@ -1428,6 +1573,7 @@ impl App {
                                 .desired_width(260.0),
                         );
                     });
+                    }
                     if cfg!(windows) {
                         field(ui, p, "드라이브 문자", |ui| {
                             ui.add(

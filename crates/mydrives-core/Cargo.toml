@@ -10,6 +10,7 @@ rust-version.workspace = true
 async-trait.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -19,6 +20,8 @@ reqwest.workspace = true
 tracing.workspace = true
 
 directories = "6"
+# PKCE verifiers and the sign-in `state` need real randomness.
+getrandom = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
