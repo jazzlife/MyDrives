@@ -99,9 +99,16 @@ jobs:
       # kernel extension, so `installer` is all it takes.
       - name: Install FUSE-T
         if: runner.os == 'macOS'
+        env:
+          # The runners share GitHub's unauthenticated API rate limit, and
+          # an anonymous call to releases/latest answered 403 from one of
+          # them (v0.2.0, 2026-11-11). The job's own token lifts the limit.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          url=$(curl -fsSL https://api.github.com/repos/macos-fuse-t/fuse-t/releases/latest \
+          url=$(curl -fsSL --retry 5 --retry-all-errors \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/macos-fuse-t/fuse-t/releases/latest \
             | grep -o 'https://[^"]*\.pkg' | head -1)
           echo "package: $url"
           curl -fsSL "$url" -o /tmp/fuse-t.pkg
