@@ -8,7 +8,7 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 
 use mydrives_core::config::{
-    BackendConfig, FtpConfig, MemConfig, RemoteConfig, SecretRef, SmbConfig,
+    BackendConfig, FtpConfig, MemConfig, MyboxConfig, RemoteConfig, SecretRef, SmbConfig,
 };
 use mydrives_core::manager::MountState;
 use mydrives_ipc::{Request, Response};
@@ -171,6 +171,38 @@ enum AddKind {
         #[arg(long)]
         insecure_tls: bool,
         /// Only part of the account, e.g. `/public_html`.
+        #[arg(long)]
+        subpath: Option<String>,
+        /// Windows drive letter, e.g. `Z:`.
+        #[arg(long)]
+        drive: Option<String>,
+        /// Directory to mount on (macOS/Linux).
+        #[arg(long)]
+        mountpoint: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        readonly: bool,
+        #[arg(long)]
+        no_automount: bool,
+        /// Mount it right away.
+        #[arg(long)]
+        mount: bool,
+    },
+    /// 네이버 MYBOX, with a personal access token from the MYBOX web site
+    /// (설정 → 계정 및 개인 액세스 토큰 관리).
+    Mybox {
+        /// Drive name. Defaults to the folder mounted, or `MYBOX` for the
+        /// whole account.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        /// Read the access token from stdin (it is stored in the OS keychain,
+        /// never in the config).
+        #[arg(long)]
+        token_stdin: bool,
+        /// Only one folder of the account, e.g. `/Work/2026`.
         #[arg(long)]
         subpath: Option<String>,
         /// Windows drive letter, e.g. `Z:`.
@@ -597,6 +629,51 @@ fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<String>, 
                         active_timeout_secs: active_timeout,
                         accept_invalid_certs: insecure_tls,
                         max_connections: 4,
+                        secret: SecretRef::Keychain,
+                    }),
+                    id,
+                },
+                secret,
+                mount,
+            ))
+        }
+        AddKind::Mybox {
+            id,
+            label,
+            token_stdin,
+            subpath,
+            drive,
+            mountpoint,
+            provider,
+            readonly,
+            no_automount,
+            mount,
+        } => {
+            let secret = if token_stdin {
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_line(&mut buf)
+                    .context("reading the access token from stdin")?;
+                Some(buf.trim().to_string())
+            } else {
+                None
+            };
+            if secret.as_deref().map_or(true, str::is_empty) {
+                anyhow::bail!("MYBOX 개인 액세스 토큰이 필요합니다: `--token-stdin` 으로 넘기세요");
+            }
+            let id = id.unwrap_or_else(|| {
+                mydrives_core::naming::cloud_default_id("MYBOX", subpath.as_deref())
+            });
+            Ok((
+                RemoteConfig {
+                    label: label.unwrap_or_default(),
+                    automount: !no_automount,
+                    readonly,
+                    provider,
+                    drive,
+                    mountpoint,
+                    backend: BackendConfig::Mybox(MyboxConfig {
+                        subpath,
                         secret: SecretRef::Keychain,
                     }),
                     id,

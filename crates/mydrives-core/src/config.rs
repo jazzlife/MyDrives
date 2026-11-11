@@ -150,11 +150,11 @@ impl RemoteConfig {
 pub enum BackendConfig {
     Smb(SmbConfig),
     Ftp(FtpConfig),
+    Mybox(MyboxConfig),
     Mem(MemConfig),
     // Planned, deliberately not stubbed as half-working backends:
-    //   Mybox(TokenConfig), Gdrive(OAuthConfig), Onedrive(OAuthConfig),
-    //   Dropbox(OAuthConfig), Webdav(WebdavConfig)
-    // Tracked for the second phase; see README.
+    //   Gdrive(OAuthConfig), Onedrive(OAuthConfig), Dropbox(OAuthConfig),
+    //   Webdav(WebdavConfig)
 }
 
 impl BackendConfig {
@@ -162,9 +162,23 @@ impl BackendConfig {
         match self {
             BackendConfig::Smb(_) => "smb",
             BackendConfig::Ftp(_) => "ftp",
+            BackendConfig::Mybox(_) => "mybox",
             BackendConfig::Mem(_) => "mem",
         }
     }
+}
+
+/// 네이버 MYBOX over its Open API. The only credential is a personal access
+/// token the user makes on the MYBOX web site; it is the drive's secret and
+/// lives where passwords do.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MyboxConfig {
+    /// Folder inside the account to expose as the mount root; the whole
+    /// account when absent.
+    #[serde(default)]
+    pub subpath: Option<String>,
+    #[serde(default)]
+    pub secret: SecretRef,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

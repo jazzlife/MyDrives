@@ -103,6 +103,20 @@ impl BackendFactory for Factory {
                     },
                 ))
             }
+            BackendConfig::Mybox(mybox) => {
+                let token = load_secret(&cfg.id, &mybox.secret)?.unwrap_or_default();
+                if token.trim().is_empty() {
+                    return Err(Error::AuthFailed(format!(
+                        "'{}'에 저장된 MYBOX 액세스 토큰이 없습니다 - 드라이브 편집에서 토큰을 넣으세요",
+                        cfg.id
+                    )));
+                }
+                Ok(mydrives_backend_cloud::mybox::backend(
+                    cfg.id.clone(),
+                    token.trim().to_string(),
+                    mybox.subpath.clone(),
+                ))
+            }
             BackendConfig::Mem(mem) => Ok(Arc::new(if mem.fixture {
                 fixture(&cfg.id)
             } else {

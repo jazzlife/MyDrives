@@ -17,7 +17,7 @@ Rust 코어 하나에 OS별 마운트 어댑터를 붙이는 구조입니다. �
                    Vfs  ── inode·핸들·메타데이터 캐시·읽기 청크
                     │
                     ▼
-                 Backend  (SMB ✅ | FTP ✅ | MYBOX* | Google Drive* | OneDrive* | Dropbox*)
+                 Backend  (SMB ✅ | FTP ✅ | 네이버 MYBOX ✅ | Google Drive* | OneDrive* | Dropbox*)
                                                                     * 2차 구현 예정
 ```
 
@@ -37,7 +37,8 @@ Rust 코어 하나에 OS별 마운트 어댑터를 붙이는 구조입니다. �
 | 로그인 시 자동 시작 (LaunchAgent / `Run` 키) | ✅ 양 OS 검증 |
 | 끊김 감지 + 자동 재연결 워치독 | ✅ |
 | **FTP / FTPS 백엔드** — MLSD·REST 기반, 3 OS 공용 | ✅ FTP 서버 대상 통합 테스트 |
-| WebDAV·네이버 MYBOX·Google Drive·OneDrive·Dropbox | ⏳ 2차 구현 |
+| **네이버 MYBOX 백엔드** — Open API(개인 액세스 토큰), 파일 단위 전송 + 로컬 스테이징 | ✅ 모의 서버 테스트 (실제 계정 확인 대기) |
+| WebDAV·Google Drive·OneDrive·Dropbox | ⏳ 2차 구현 |
 
 설계 근거와 라이선스 판단: [docs/DECISIONS.md](docs/DECISIONS.md)
 (검증 결과 전문·내부 구조·로드맵 문서는 아직 작성 전입니다.)
@@ -113,6 +114,10 @@ echo 'mypassword' | mydrives add ftp \
   --drive F: --password-stdin --mount
 # 자체 서명 인증서를 쓰는 NAS면 --insecure-tls, 평문 FTP면 --security plain,
 # 암묵적 FTPS(990)면 --security implicit
+
+# 2-2) 네이버 MYBOX 등록 — MYBOX 웹 설정 → 계정 및 개인 액세스 토큰 관리에서 만든 토큰
+echo 'mbx_pat_…' | mydrives add mybox --token-stdin --subpath /업무 --mount
+# 토큰은 30~180일 뒤 만료됩니다. 만료되면 드라이브 편집에서 새 토큰을 넣으세요
 
 # 3) 상태 확인 / 마운트 제어
 mydrives status
@@ -278,6 +283,8 @@ LaunchDaemon은 메뉴바 UI를 띄울 수 없습니다. 그래서 MyDrives는 �
 crates/
   mydrives-core/           VFS, inode/핸들, 캐시, 설정, 자격증명, 마운트 매니저
   mydrives-backend-smb/    SMB2/3 백엔드 (순수 Rust)
+  mydrives-backend-ftp/    FTP/FTPS 백엔드 (쓰기는 로컬 스테이징 후 한 번에 업로드)
+  mydrives-backend-cloud/  클라우드 백엔드 공통층(id↔경로, 스테이징) + 네이버 MYBOX
   mydrives-mount-windows/  WinFsp 어댑터
   mydrives-mount-nfs/      루프백 NFSv3 서버 (macOS 기본, 커널 익스텐션 불필요)
   mydrives-mount-fuse/     FUSE 어댑터 (Linux, 선택적 macFUSE)

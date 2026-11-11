@@ -4,6 +4,7 @@ members = [
   "crates/mydrives-core",
   "crates/mydrives-backend-smb",
   "crates/mydrives-backend-ftp",
+  "crates/mydrives-backend-cloud",
   "crates/mydrives-ipc",
   "crates/mydrives-mount-fuse",
   "crates/mydrives-mount-nfs",
@@ -29,6 +30,7 @@ rust-version = "1.85"
 mydrives-core = { path = "crates/mydrives-core" }
 mydrives-backend-smb = { path = "crates/mydrives-backend-smb" }
 mydrives-backend-ftp = { path = "crates/mydrives-backend-ftp" }
+mydrives-backend-cloud = { path = "crates/mydrives-backend-cloud" }
 mydrives-ipc = { path = "crates/mydrives-ipc" }
 mydrives-mount-fuse = { path = "crates/mydrives-mount-fuse" }
 mydrives-mount-nfs = { path = "crates/mydrives-mount-nfs" }
@@ -47,7 +49,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"
 toml = "0.8"
 semver = "1"
 sha2 = "0.11"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "charset"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "charset", "multipart", "stream"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

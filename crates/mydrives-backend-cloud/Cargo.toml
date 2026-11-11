@@ -1,0 +1,30 @@
+[package]
+name = "mydrives-backend-cloud"
+description = "Cloud drive backends for MyDrives: services that hand files out whole over HTTPS (네이버 MYBOX first)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mydrives-core.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
+tracing.workspace = true
+# The same HTTP client the updater uses - rustls, no OpenSSL to ship. The
+# `multipart` and `stream` features are what a file upload and a streamed
+# download need; they are set on the workspace entry so one reqwest is built.
+reqwest.workspace = true
+# Turns a staged file into a request body without reading it into memory.
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# An HTTP server in the test process that answers like MYBOX does, so the
+# request shapes - paths, the bearer header, the two-step upload - are checked
+# without a token or a network.
+wiremock = "0.6"
+tempfile = "3"

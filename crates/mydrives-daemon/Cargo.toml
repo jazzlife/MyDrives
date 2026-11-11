@@ -23,6 +23,7 @@ macfuse = ["mydrives-mount-fuse/macfuse"]
 mydrives-core.workspace = true
 mydrives-backend-smb.workspace = true
 mydrives-backend-ftp.workspace = true
+mydrives-backend-cloud.workspace = true
 mydrives-ipc.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

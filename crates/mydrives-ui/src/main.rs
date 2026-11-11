@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, CornerRadius, FontId, Margin, RichText, Sense, Stroke, Vec2};
 
-use mydrives_core::config::{BackendConfig, FtpConfig, RemoteConfig, SecretRef, SmbConfig};
+use mydrives_core::config::{
+    BackendConfig, FtpConfig, MyboxConfig, RemoteConfig, SecretRef, SmbConfig,
+};
 use mydrives_core::manager::{MountState, RemoteStatus};
 use mydrives_core::update::{UpdateState, UpdateStatus};
 use mydrives_ipc::{Request, Response, UpdateAction};
@@ -205,10 +207,11 @@ struct App {
 /// 한 폼에 둘을 담는 것은, 사용자가 채우는 칸이 거의 같기 때문입니다 - 주소,
 /// 계정, 비밀번호, 어디에 붙일지. 다른 것은 "무엇을 고르느냐"(SMB는 공유 폴더,
 /// FTP는 계정 안의 경로)와 FTP의 TLS 선택뿐입니다.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DriveKind {
     Smb,
     Ftp,
+    Mybox,
 }
 
 impl DriveKind {
@@ -216,6 +219,7 @@ impl DriveKind {
         match self {
             DriveKind::Smb => "NAS (SMB)",
             DriveKind::Ftp => "FTP",
+            DriveKind::Mybox => "네이버 MYBOX",
         }
     }
 
@@ -223,8 +227,18 @@ impl DriveKind {
         match self {
             DriveKind::Smb => "QNAP·Synology 등 NAS의 공유 폴더를 드라이브로 연결합니다",
             DriveKind::Ftp => "웹호스팅·공유기·구형 NAS의 FTP 계정을 드라이브로 연결합니다",
+            DriveKind::Mybox => {
+                "네이버 MYBOX를 드라이브로 연결합니다. MYBOX 웹 설정 → 계정 및 개인 액세스 토큰 관리에서 만든 토큰이 필요합니다"
+            }
         }
     }
+
+    /// A service with an account and a token, not a server with an address.
+    fn is_cloud(self) -> bool {
+        matches!(self, DriveKind::Mybox)
+    }
+
+    const ALL: [DriveKind; 3] = [DriveKind::Smb, DriveKind::Ftp, DriveKind::Mybox];
 }
 
 /// 추가 폼. SMB(NAS)와 FTP를 받습니다.
@@ -310,6 +324,10 @@ impl Form {
                 form.active_timeout = ftp.active_timeout_secs.to_string();
                 form.insecure_tls = ftp.accept_invalid_certs;
             }
+            BackendConfig::Mybox(mybox) => {
+                form.kind = DriveKind::Mybox;
+                form.subpath = mybox.subpath.clone().unwrap_or_default();
+            }
             BackendConfig::Mem(_) => {}
         }
         // 고급 칸에 값이 있으면 펼쳐서 보여 줍니다 - 숨긴 채로는 고칠 수 없습니다.
@@ -377,7 +395,7 @@ impl Form {
                     .filter(|leaf| !leaf.is_empty())
                     .unwrap_or(share)
             }
-            DriveKind::Ftp => self.subpath.trim().to_string(),
+            DriveKind::Ftp | DriveKind::Mybox => self.subpath.trim().to_string(),
         };
         if !self.port_edited {
             self.port = self.default_port().to_string();
@@ -387,6 +405,9 @@ impl Form {
                 DriveKind::Smb => share.clone(),
                 DriveKind::Ftp => {
                     mydrives_core::naming::ftp_default_id(self.host.trim(), opt(&self.subpath).as_deref())
+                }
+                DriveKind::Mybox => {
+                    mydrives_core::naming::cloud_default_id("MYBOX", opt(&self.subpath).as_deref())
                 }
             };
             // 이름이 겹치면 **기존 드라이브를 덮어씁니다** — id가 설정 키이자
@@ -424,6 +445,8 @@ impl Form {
             // 명시적 FTPS는 평문과 같은 21번에서 AUTH TLS로 올라갑니다.
             DriveKind::Ftp if self.security == "implicit" => 990,
             DriveKind::Ftp => 21,
+            // HTTPS to the service; there is no port to choose.
+            DriveKind::Mybox => 443,
         }
     }
 
@@ -434,11 +457,19 @@ impl Form {
         if self.id.trim().is_empty() {
             return Err("드라이브 이름을 입력하세요");
         }
-        if self.host.trim().is_empty() {
-            return Err("호스트(IP 또는 주소)를 입력하세요");
-        }
-        if self.port.trim().parse::<u16>().is_err() {
-            return Err("포트는 1~65535 사이의 숫자여야 합니다");
+        if self.kind.is_cloud() {
+            // The token is the whole credential. Editing may leave it blank
+            // to keep the stored one.
+            if !self.editing && self.password.trim().is_empty() {
+                return Err("액세스 토큰을 입력하세요");
+            }
+        } else {
+            if self.host.trim().is_empty() {
+                return Err("호스트(IP 또는 주소)를 입력하세요");
+            }
+            if self.port.trim().parse::<u16>().is_err() {
+                return Err("포트는 1~65535 사이의 숫자여야 합니다");
+            }
         }
         if cfg!(windows) {
             if self.drive.trim().is_empty() {
@@ -500,6 +531,11 @@ impl Form {
                     max_connections: 4,
                     secret: SecretRef::Keychain,
                 }),
+                DriveKind::Mybox => BackendConfig::Mybox(MyboxConfig {
+                    subpath: clean_subpath(&self.subpath),
+                    // The token goes to the keychain like a password does.
+                    secret: SecretRef::Keychain,
+                }),
             },
         }
     }
@@ -510,6 +546,7 @@ fn kind_label(kind: &str) -> &str {
     match kind {
         "smb" => "NAS (SMB)",
         "ftp" => "FTP",
+        "mybox" => "네이버 MYBOX",
         "mem" => "테스트",
         other => other,
     }
@@ -1187,7 +1224,7 @@ impl App {
         // 잠급니다.
         if !form.editing {
             ui.horizontal(|ui| {
-                for kind in [DriveKind::Smb, DriveKind::Ftp] {
+                for kind in DriveKind::ALL {
                     if ui
                         .selectable_label(form.kind == kind, RichText::new(kind.label()))
                         .clicked()
@@ -1211,18 +1248,21 @@ impl App {
                 .num_columns(2)
                 .spacing([14.0, 10.0])
                 .show(ui, |ui| {
-                    // 호스트가 먼저입니다: 드라이브 이름이 여기서 나옵니다.
-                    field(ui, p, "호스트", |ui| {
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut form.host)
-                                .hint_text(match form.kind {
-                                    DriveKind::Smb => "192.168.0.10 또는 nas.example.com",
-                                    DriveKind::Ftp => "ftp.example.com 또는 192.168.0.10",
-                                })
-                                .desired_width(260.0),
-                        );
-                        source_changed |= r.changed();
-                    });
+                    // 호스트가 먼저입니다: 드라이브 이름이 여기서 나옵니다. 클라우드
+                    // 서비스는 주소가 없습니다 - 토큰이 곧 계정입니다.
+                    if !form.kind.is_cloud() {
+                        field(ui, p, "호스트", |ui| {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut form.host)
+                                    .hint_text(match form.kind {
+                                        DriveKind::Smb => "192.168.0.10 또는 nas.example.com",
+                                        _ => "ftp.example.com 또는 192.168.0.10",
+                                    })
+                                    .desired_width(260.0),
+                            );
+                            source_changed |= r.changed();
+                        });
+                    }
                     match form.kind {
                         DriveKind::Smb => field(ui, p, "공유 폴더", |ui| {
                             let r = ui.add(
@@ -1238,6 +1278,14 @@ impl App {
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut form.subpath)
                                     .hint_text("계정 전체를 쓰려면 비워 둠 (예: /public_html)")
+                                    .desired_width(260.0),
+                            );
+                            source_changed |= r.changed();
+                        }),
+                        DriveKind::Mybox => field(ui, p, "폴더", |ui| {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut form.subpath)
+                                    .hint_text("MYBOX 전체를 쓰려면 비워 둠 (예: /업무)")
                                     .desired_width(260.0),
                             );
                             source_changed |= r.changed();
@@ -1351,18 +1399,28 @@ impl App {
                             form.name_edited = true;
                         }
                     });
-                    field(ui, p, "계정", |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut form.user)
-                                .hint_text(match form.kind {
-                                    DriveKind::Smb => "NAS 로그인 ID",
-                                    DriveKind::Ftp => "FTP 로그인 ID (익명이면 anonymous)",
-                                })
-                                .desired_width(260.0),
-                        );
-                    });
-                    field(ui, p, "비밀번호", |ui| {
-                        let hint = if form.editing { "비워 두면 저장된 비밀번호 유지" } else { "" };
+                    if !form.kind.is_cloud() {
+                        field(ui, p, "계정", |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut form.user)
+                                    .hint_text(match form.kind {
+                                        DriveKind::Smb => "NAS 로그인 ID",
+                                        _ => "FTP 로그인 ID (익명이면 anonymous)",
+                                    })
+                                    .desired_width(260.0),
+                            );
+                        });
+                    }
+                    // A cloud service's credential is a token, and it is typed
+                    // (pasted) into the same kind of box a password is.
+                    let secret_label = if form.kind.is_cloud() { "액세스 토큰" } else { "비밀번호" };
+                    field(ui, p, secret_label, |ui| {
+                        let hint = match (form.editing, form.kind.is_cloud()) {
+                            (true, true) => "비워 두면 저장된 토큰 유지",
+                            (true, false) => "비워 두면 저장된 비밀번호 유지",
+                            (false, true) => "MYBOX 웹에서 만든 개인 액세스 토큰 (mbx_pat_…)",
+                            (false, false) => "",
+                        };
                         ui.add(
                             egui::TextEdit::singleline(&mut form.password)
                                 .password(true)
@@ -1993,6 +2051,43 @@ mod tests {
 
         form.follow_sources(&[], &["jazzlife".to_string(), "jazzlife-2".to_string()]);
         assert_eq!(form.id, "jazzlife-3");
+    }
+
+    #[test]
+    fn a_mybox_drive_needs_a_token_and_is_named_after_its_folder() {
+        let mut form = Form {
+            home: "/Users/x".into(),
+            kind: DriveKind::Mybox,
+            ..Form::default()
+        };
+        // No host, no port: the whole account is the drive.
+        form.follow_sources(&[], &[]);
+        assert_eq!(form.id, "MYBOX");
+        assert_eq!(form.name, "MYBOX");
+        if !cfg!(windows) {
+            assert_eq!(form.mountpoint, "/Users/x/MyDrives/MYBOX");
+        }
+        form.mountpoint = "/Users/x/MyDrives/MYBOX".into();
+        form.drive = "Z:".into();
+        assert_eq!(form.validate(), Err("액세스 토큰을 입력하세요"));
+        form.password = "mbx_pat_abc".into();
+        assert!(form.validate().is_ok());
+
+        // One folder of it: named after the folder.
+        form.subpath = "/업무/2026".into();
+        form.follow_sources(&[], &[]);
+        assert_eq!(form.id, "2026");
+        match form.to_remote().backend {
+            BackendConfig::Mybox(m) => assert_eq!(m.subpath.as_deref(), Some("/업무/2026")),
+            _ => panic!("MYBOX 백엔드여야 합니다"),
+        }
+
+        // Editing may leave the token blank: the stored one stays.
+        let mut edit = Form::from_remote(&form.to_remote());
+        assert_eq!(edit.kind, DriveKind::Mybox);
+        assert_eq!(edit.subpath, "/업무/2026");
+        edit.password.clear();
+        assert!(edit.validate().is_ok());
     }
 
     #[test]

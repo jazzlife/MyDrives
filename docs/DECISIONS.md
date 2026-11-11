@@ -386,3 +386,46 @@ Finder 폴더 열기가 수 초 걸렸습니다. fuser 요청 로그로 잰 원�
 측정(콜드): Libraries(9) 1.19s→0.38s, Projects(14) 0.98s→0.41s, Products(38) 0.71s,
 웜은 0.01~0.16s. 남는 비용은 폴더당 목록 1회 + 처음 보는 이름의 stat뿐입니다.
 다른 기기에서 만든 파일은 최대 10초 뒤에 보입니다.
+
+## 11. 클라우드 백엔드 공통층 + 네이버 MYBOX (2026-11-11)
+
+MYBOX, Google Drive, OneDrive, Dropbox는 파일시스템 입장에서 같은 모양입니다:
+모든 항목에 **id**가 있고, 폴더는 id로 나열하며, 파일은 서비스가 주는 URL로
+통째로 내려받고 올립니다. 오프셋 쓰기는 어디에도 없습니다. 그래서 "파일시스템이
+되는 일"(경로→id 해석, 열린 파일의 로컬 복사본, 닫을 때 업로드)은
+`mydrives-backend-cloud`의 `CloudBackend`가 한 번 하고, 서비스별 코드는
+`CloudApi`(list·mkdir·delete·rename·move·download·upload·quota) 열 개 남짓만
+구현합니다. 다음 서비스는 이 트레이트 구현 하나씩입니다.
+
+- 읽기: 범위 요청을 받는 서비스는 다운로드 URL에서 조각 단위로 바로 읽고, 받지
+  않는 서비스(MYBOX)는 첫 읽기에 파일 전체를 로컬 복사본으로 받습니다.
+- 쓰기: 항상 로컬 복사본에 쓰고 flush/close 때 한 번에 올립니다(FTP와 같은
+  이유 — 커널은 쓰기를 순서 없이 조각으로 줍니다). `create` 뒤 아무것도 안 쓴
+  파일(touch)도 close 때 빈 파일로 한 번 올라갑니다.
+- 경로 해석: 드라이브 최상위에서 한 단계씩 목록을 받아 내려갑니다(폴더당 1회,
+  10초 캐시). 이름 비교는 서비스의 대소문자 규칙을 따릅니다.
+- rename: 같은 폴더면 rename, 다른 폴더면 move(+rename). 대상이 있으면 replace
+  일 때만 먼저 지우고 진행(원자적이지 않음, `rename_replace=false`).
+- rmdir는 비어 있을 때만(서비스는 통째로 지우므로 검사는 우리 몫).
+
+**MYBOX Open API** (developers.mybox.naver.com, 2026-11-11 원문 확인):
+베이스 `https://open-api.mybox.naver.com/v1`, `Authorization: Bearer mbx_pat_…`.
+루트 목록 `GET /drive/resources`, 폴더 목록 `GET /drive/folders/{id}/resources`
+(count≤1000, cursor 페이징), 속성 `GET /drive/resources/{id}`, 폴더 생성
+`POST /drive/folders`, 삭제 `DELETE /drive/resources/{id}`(휴지통), 이동
+`POST …/move {parentId}`, 이름 변경 `POST …/rename {name}`, 다운로드
+`GET /drive/files/{id}/download` → 1회용 URL(10분) → GET, 업로드
+`POST /drive/files {fileName,fileSize,isOverwrite,parentId}` → URL(48시간) →
+`multipart/form-data`의 `Filedata`로 POST, 용량 `GET /drive/storage`.
+한도: 다운로드 5만/일, 삭제 240/분, 검색 30/분. 루트는 id가 없어 `parentId`
+생략으로 가리키며, 루트로의 move는 API가 받지 않아 거부합니다.
+
+토큰은 OAuth가 아니라 **개인 액세스 토큰**(30·60·90·180일)이라 갱신이 없습니다.
+만료되면 모든 호출이 401이고, 그 경우만 "토큰이 만료되었거나 잘못됨, 편집에서
+새 토큰" 메시지로 바꿔 보냅니다. 토큰은 비밀번호와 같은 자리(키체인)에 둡니다.
+
+검증: 백엔드 의미론은 메모리 모의 서비스로, MYBOX 요청 모양(경로·헤더·페이징·
+2단계 업로드/다운로드·토큰 비노출)은 모의 HTTP 서버(wiremock)로 시험했습니다.
+실제 계정에서의 확인(특히 업로드 URL의 응답, 다운로드 URL의 Range 지원 여부)은
+사용자 토큰이 있어야 합니다. Range가 된다면 `range_reads=true`로 바꾸어 큰 파일을
+통째로 받지 않게 할 수 있습니다.

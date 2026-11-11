@@ -25,12 +25,32 @@ pub fn product_name(backend: &BackendConfig) -> String {
             name if name == "NAS" => "FTP".to_string(),
             name => name,
         },
+        // A cloud service is its own product; the folder inside it is what
+        // the id says.
+        BackendConfig::Mybox(_) => "네이버 MYBOX".to_string(),
         BackendConfig::Mem(_) => "테스트 볼륨".to_string(),
         // Planned backends name themselves after the service, not the folder:
-        //   Mybox(_)    => "네이버 MYBOX"
         //   Gdrive(_)   => "Google Drive"
         //   Onedrive(_) => "OneDrive"
         //   Dropbox(_)  => "Dropbox"
+    }
+}
+
+/// What a cloud drive is called when the user does not say: the folder it
+/// exposes, or the service's short name when it is the whole account.
+pub fn cloud_default_id(service: &str, subpath: Option<&str>) -> String {
+    let leaf = subpath
+        .unwrap_or("")
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if leaf.is_empty() {
+        service.to_string()
+    } else {
+        leaf
     }
 }
 
@@ -111,6 +131,8 @@ pub fn same_target(a: &BackendConfig, b: &BackendConfig) -> bool {
         (BackendConfig::Ftp(x), BackendConfig::Ftp(y)) => {
             x.host.eq_ignore_ascii_case(&y.host) && x.subpath == y.subpath
         }
+        // One account per token; two MYBOX drives differ only by folder.
+        (BackendConfig::Mybox(x), BackendConfig::Mybox(y)) => x.subpath == y.subpath,
         (BackendConfig::Mem(_), BackendConfig::Mem(_)) => true,
         _ => false,
     }
@@ -155,6 +177,7 @@ pub fn is_generated_label(label: &str, backend: &BackendConfig) -> bool {
         // FTP drives have had product names from the start, so the only older
         // shape to recognise is the bare host the first version wrote.
         BackendConfig::Ftp(ftp) => label == ftp.host,
+        BackendConfig::Mybox(_) => label == "네이버 MYBOX",
         BackendConfig::Mem(_) => label == "in-memory test volume",
     }
 }
@@ -214,6 +237,17 @@ mod tests {
         // An IP, or an empty form, must not claim to be a NAS.
         assert_eq!(product_name(&ftp("192.168.0.10")), "FTP");
         assert_eq!(product_name(&ftp("")), "FTP");
+    }
+
+    #[test]
+    fn a_cloud_drive_is_named_after_its_folder_or_its_service() {
+        assert_eq!(cloud_default_id("MYBOX", None), "MYBOX");
+        assert_eq!(cloud_default_id("MYBOX", Some("/")), "MYBOX");
+        assert_eq!(cloud_default_id("MYBOX", Some("/Work/2026")), "2026");
+        let mybox = BackendConfig::Mybox(crate::config::MyboxConfig::default());
+        assert_eq!(product_name(&mybox), "네이버 MYBOX");
+        assert!(is_generated_label("네이버 MYBOX", &mybox));
+        assert!(!is_generated_label("내 박스", &mybox));
     }
 
     #[test]

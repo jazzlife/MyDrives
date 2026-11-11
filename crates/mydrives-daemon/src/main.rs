@@ -413,6 +413,7 @@ fn inline_secret(backend: &mut mydrives_core::config::BackendConfig, secret: Str
     match backend {
         BackendConfig::Smb(smb) => smb.secret = SecretRef::Inline { value: secret },
         BackendConfig::Ftp(ftp) => ftp.secret = SecretRef::Inline { value: secret },
+        BackendConfig::Mybox(mybox) => mybox.secret = SecretRef::Inline { value: secret },
         BackendConfig::Mem(_) => {}
     }
 }
