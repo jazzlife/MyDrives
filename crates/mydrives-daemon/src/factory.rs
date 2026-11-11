@@ -118,28 +118,30 @@ impl BackendFactory for Factory {
                 ))
             }
             BackendConfig::Gdrive(oauth) => {
-                let stored = load_secret(&cfg.id, &oauth.secret)?.unwrap_or_default();
-                if stored.trim().is_empty() {
-                    return Err(Error::AuthFailed(format!(
-                        "'{}'은 아직 Google에 로그인하지 않았습니다 - 드라이브 편집에서 로그인하세요",
-                        cfg.id
-                    )));
-                }
-                let tokens = mydrives_core::oauth::TokenSet::from_json(&stored)?;
-                let provider = mydrives_backend_cloud::gdrive::provider(
+                let provider = mydrives_core::oauth::google_provider(
                     &oauth.client_id,
                     oauth.client_secret.as_deref(),
                 );
-                // A refreshed token set goes back where the old one was, so
-                // the next start does not have to refresh again - and so a
-                // Google refresh token rotation is not lost.
-                let id = cfg.id.clone();
-                let session = mydrives_core::oauth::Session::new(provider, tokens, move |t| {
-                    if let Err(e) = secret::store(&id, &t.to_json()) {
-                        tracing::warn!(remote = %id, error = %e, "갱신된 로그인 정보를 저장하지 못했습니다");
-                    }
-                });
+                let session = oauth_session(cfg, &oauth.secret, provider)?;
                 Ok(mydrives_backend_cloud::gdrive::backend(
+                    cfg.id.clone(),
+                    session,
+                    oauth.subpath.clone(),
+                ))
+            }
+            BackendConfig::Onedrive(oauth) => {
+                let provider = mydrives_core::oauth::microsoft_provider(&oauth.client_id);
+                let session = oauth_session(cfg, &oauth.secret, provider)?;
+                Ok(mydrives_backend_cloud::onedrive::backend(
+                    cfg.id.clone(),
+                    session,
+                    oauth.subpath.clone(),
+                ))
+            }
+            BackendConfig::Dropbox(oauth) => {
+                let provider = mydrives_core::oauth::dropbox_provider(&oauth.client_id);
+                let session = oauth_session(cfg, &oauth.secret, provider)?;
+                Ok(mydrives_backend_cloud::dropbox::backend(
                     cfg.id.clone(),
                     session,
                     oauth.subpath.clone(),
@@ -152,4 +154,28 @@ impl BackendFactory for Factory {
             })),
         }
     }
+}
+
+/// The signed-in session for an OAuth drive, from the token set stored as
+/// its secret. A refreshed set goes back where the old one was, so the next
+/// start does not refresh again - and a rotated refresh token is not lost.
+fn oauth_session(
+    cfg: &RemoteConfig,
+    how: &mydrives_core::config::SecretRef,
+    provider: mydrives_core::oauth::Provider,
+) -> Result<Arc<mydrives_core::oauth::Session>> {
+    let stored = load_secret(&cfg.id, how)?.unwrap_or_default();
+    if stored.trim().is_empty() {
+        return Err(Error::AuthFailed(format!(
+            "'{}'은 아직 {}에 로그인하지 않았습니다 - 드라이브 편집에서 로그인하세요",
+            cfg.id, provider.name
+        )));
+    }
+    let tokens = mydrives_core::oauth::TokenSet::from_json(&stored)?;
+    let id = cfg.id.clone();
+    Ok(mydrives_core::oauth::Session::new(provider, tokens, move |t| {
+        if let Err(e) = secret::store(&id, &t.to_json()) {
+            tracing::warn!(remote = %id, error = %e, "갱신된 로그인 정보를 저장하지 못했습니다");
+        }
+    }))
 }

@@ -21,6 +21,8 @@ fn session(server: &MockServer, access: &str) -> Arc<Session> {
             client_secret: None,
             scopes: vec![],
             extra_auth_params: vec![],
+            loopback_host: "127.0.0.1",
+            preferred_port: None,
         },
         TokenSet {
             access_token: access.into(),

@@ -18,6 +18,8 @@ fn provider(server: &MockServer) -> Provider {
         client_secret: None,
         scopes: vec!["files.read".into(), "files.write".into()],
         extra_auth_params: vec![("access_type".into(), "offline".into())],
+        loopback_host: "127.0.0.1",
+        preferred_port: None,
     }
 }
 
@@ -37,6 +39,7 @@ fn fake_browser(url: &str) -> mydrives_core::error::Result<()> {
     assert_eq!(get("access_type").as_deref(), Some("offline"));
     assert_eq!(get("scope").as_deref(), Some("files.read%20files.write"));
     let redirect = get("redirect_uri").unwrap().replace("%3A", ":").replace("%2F", "/");
+    let redirect = redirect.trim_end_matches('/').to_string();
     let state = get("state").unwrap();
     assert!(get("code_challenge").map_or(false, |c| c.len() >= 43));
     std::thread::spawn(move || {
@@ -82,7 +85,9 @@ async fn a_refusal_in_the_browser_is_an_auth_error_not_a_hang() {
             .find_map(|p| p.strip_prefix("redirect_uri="))
             .unwrap()
             .replace("%3A", ":")
-            .replace("%2F", "/");
+            .replace("%2F", "/")
+            .trim_end_matches('/')
+            .to_string();
         std::thread::spawn(move || {
             let _ = http_get(&format!("{redirect}/?error=access_denied"));
         });

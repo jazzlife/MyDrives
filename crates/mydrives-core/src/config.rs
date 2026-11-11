@@ -152,9 +152,11 @@ pub enum BackendConfig {
     Ftp(FtpConfig),
     Mybox(MyboxConfig),
     Gdrive(OAuthConfig),
+    Onedrive(OAuthConfig),
+    Dropbox(OAuthConfig),
     Mem(MemConfig),
-    // Planned, deliberately not stubbed as half-working backends:
-    //   Onedrive(OAuthConfig), Dropbox(OAuthConfig), Webdav(WebdavConfig)
+    // Planned, deliberately not stubbed as a half-working backend:
+    //   Webdav(WebdavConfig)
 }
 
 impl BackendConfig {
@@ -164,6 +166,8 @@ impl BackendConfig {
             BackendConfig::Ftp(_) => "ftp",
             BackendConfig::Mybox(_) => "mybox",
             BackendConfig::Gdrive(_) => "gdrive",
+            BackendConfig::Onedrive(_) => "onedrive",
+            BackendConfig::Dropbox(_) => "dropbox",
             BackendConfig::Mem(_) => "mem",
         }
     }

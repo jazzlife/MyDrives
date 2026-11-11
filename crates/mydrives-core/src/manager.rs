@@ -663,6 +663,12 @@ fn describe_config(cfg: &RemoteConfig) -> String {
         crate::config::BackendConfig::Gdrive(g) => {
             format!("gdrive://{}", g.subpath.as_deref().unwrap_or("/"))
         }
+        crate::config::BackendConfig::Onedrive(o) => {
+            format!("onedrive://{}", o.subpath.as_deref().unwrap_or("/"))
+        }
+        crate::config::BackendConfig::Dropbox(d) => {
+            format!("dropbox://{}", d.subpath.as_deref().unwrap_or("/"))
+        }
         crate::config::BackendConfig::Mem(_) => "mem://".to_string(),
     }
 }

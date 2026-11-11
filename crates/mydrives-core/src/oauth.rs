@@ -36,6 +36,13 @@ pub struct Provider {
     /// Service-specific query parameters for the sign-in page, such as
     /// Google's `access_type=offline`.
     pub extra_auth_params: Vec<(String, String)>,
+    /// The host name in the redirect URI. `127.0.0.1` is what RFC 8252
+    /// recommends and Google accepts; Microsoft only matches `localhost`
+    /// (and ignores the port for it); Dropbox wants the registered form.
+    pub loopback_host: &'static str,
+    /// A port to try first, for a service that matches the registered
+    /// redirect URI port for port (Dropbox). Any free port otherwise.
+    pub preferred_port: Option<u16>,
 }
 
 /// Google Drive, for the user's own OAuth client ("Desktop app" in the
@@ -59,6 +66,51 @@ pub fn google_provider(client_id: &str, client_secret: Option<&str>) -> Provider
             ("access_type".into(), "offline".into()),
             ("prompt".into(), "consent".into()),
         ],
+        loopback_host: "127.0.0.1",
+        preferred_port: None,
+    }
+}
+
+/// OneDrive (personal, and work or school) through Microsoft Graph, for an
+/// app registered in the user's Entra tenant as "Mobile and desktop
+/// applications" with the redirect URI `http://localhost`. Microsoft ignores
+/// the port for localhost and does not support `[::1]`, so the redirect
+/// names `localhost` and the listener takes care to be reachable there.
+pub fn microsoft_provider(client_id: &str) -> Provider {
+    Provider {
+        name: "Microsoft",
+        auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize".into(),
+        token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token".into(),
+        client_id: client_id.trim().to_string(),
+        client_secret: None,
+        // `offline_access` is what makes Microsoft hand out a refresh token.
+        scopes: vec!["Files.ReadWrite.All".into(), "offline_access".into()],
+        extra_auth_params: vec![("response_mode".into(), "query".into())],
+        loopback_host: "localhost",
+        preferred_port: None,
+    }
+}
+
+/// The port the Dropbox app has to be registered with (`http://localhost:53682/`
+/// - the same one rclone uses, so a user who has set that up already is
+/// done), because Dropbox matches the redirect URI port for port.
+pub const DROPBOX_PORT: u16 = 53682;
+
+/// Dropbox, for an app made in the Dropbox App Console with the redirect
+/// URI `http://localhost:53682/`. Dropbox apps have no secret for PKCE.
+pub fn dropbox_provider(client_id: &str) -> Provider {
+    Provider {
+        name: "Dropbox",
+        auth_url: "https://www.dropbox.com/oauth2/authorize".into(),
+        token_url: "https://api.dropboxapi.com/oauth2/token".into(),
+        client_id: client_id.trim().to_string(),
+        client_secret: None,
+        // Dropbox scopes are set on the app, not asked for here.
+        scopes: vec![],
+        // `offline` is what makes Dropbox hand out a refresh token.
+        extra_auth_params: vec![("token_access_type".into(), "offline".into())],
+        loopback_host: "localhost",
+        preferred_port: Some(DROPBOX_PORT),
     }
 }
 
@@ -198,11 +250,24 @@ pub async fn authorize(
     timeout: Duration,
     open: impl FnOnce(&str) -> Result<()>,
 ) -> Result<TokenSet> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(Error::Io)?;
+    // The preferred port first (a service that matches the registered port
+    // needs it), any free port otherwise.
+    let listener = match provider.preferred_port {
+        Some(p) => match tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
+            Ok(l) => l,
+            Err(_) => tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(Error::Io)?,
+        },
+        None => tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(Error::Io)?,
+    };
     let port = listener.local_addr().map_err(Error::Io)?.port();
-    let redirect_uri = format!("http://127.0.0.1:{port}");
+    // A redirect to `localhost` may resolve to `::1` first in the browser;
+    // listening there too, on the same port, means it lands either way.
+    let listener6 = if provider.loopback_host == "localhost" {
+        tokio::net::TcpListener::bind(("::1", port)).await.ok()
+    } else {
+        None
+    };
+    let redirect_uri = format!("http://{}:{port}/", provider.loopback_host);
 
     let verifier = pkce_verifier();
     let challenge = base64url(&sha256(verifier.as_bytes()));
@@ -222,7 +287,7 @@ pub async fn authorize(
 
     open(&url)?;
 
-    let (code, returned_state) = tokio::time::timeout(timeout, wait_for_redirect(&listener))
+    let (code, returned_state) = tokio::time::timeout(timeout, wait_for_redirect(&listener, listener6.as_ref()))
         .await
         .map_err(|_| {
             Error::Timeout(format!(
@@ -251,9 +316,19 @@ pub async fn authorize(
 
 /// Accepts the browser's return visit and takes `code` and `state` from it.
 /// Answers with a small page so the tab does not sit on a blank screen.
-async fn wait_for_redirect(listener: &tokio::net::TcpListener) -> Result<(String, String)> {
+async fn wait_for_redirect(
+    listener: &tokio::net::TcpListener,
+    listener6: Option<&tokio::net::TcpListener>,
+) -> Result<(String, String)> {
     loop {
-        let (mut stream, _) = listener.accept().await.map_err(Error::Io)?;
+        let (mut stream, _) = match listener6 {
+            Some(l6) => tokio::select! {
+                a = listener.accept() => a,
+                b = l6.accept() => b,
+            },
+            None => listener.accept().await,
+        }
+        .map_err(Error::Io)?;
         let mut buf = vec![0u8; 8192];
         let n = stream.read(&mut buf).await.map_err(Error::Io)?;
         let request = String::from_utf8_lossy(&buf[..n]).to_string();

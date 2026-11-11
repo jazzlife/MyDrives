@@ -414,7 +414,9 @@ fn inline_secret(backend: &mut mydrives_core::config::BackendConfig, secret: Str
         BackendConfig::Smb(smb) => smb.secret = SecretRef::Inline { value: secret },
         BackendConfig::Ftp(ftp) => ftp.secret = SecretRef::Inline { value: secret },
         BackendConfig::Mybox(mybox) => mybox.secret = SecretRef::Inline { value: secret },
-        BackendConfig::Gdrive(oauth) => oauth.secret = SecretRef::Inline { value: secret },
+        BackendConfig::Gdrive(oauth)
+        | BackendConfig::Onedrive(oauth)
+        | BackendConfig::Dropbox(oauth) => oauth.secret = SecretRef::Inline { value: secret },
         BackendConfig::Mem(_) => {}
     }
 }

@@ -16,8 +16,10 @@
 //! close - the same trade the FTP backend makes, because the kernel hands
 //! writes over out of order and no service takes them that way.
 
+pub mod dropbox;
 pub mod gdrive;
 pub mod mybox;
+pub mod onedrive;
 mod rfc3339;
 mod stage;
 

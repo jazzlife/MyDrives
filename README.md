@@ -17,8 +17,8 @@ Rust 코어 하나에 OS별 마운트 어댑터를 붙이는 구조입니다. �
                    Vfs  ── inode·핸들·메타데이터 캐시·읽기 청크
                     │
                     ▼
-                 Backend  (SMB ✅ | FTP ✅ | 네이버 MYBOX ✅ | Google Drive ✅ | OneDrive* | Dropbox*)
-                                                                    * 2차 구현 예정
+                 Backend  (SMB ✅ | FTP ✅ | 네이버 MYBOX ✅ | Google Drive ✅ | OneDrive ✅ | Dropbox ✅)
+                                                                    클라우드 4종은 실제 계정 확인 대기
 ```
 
 ## 1차 구현 범위 (현재 상태)
@@ -39,7 +39,9 @@ Rust 코어 하나에 OS별 마운트 어댑터를 붙이는 구조입니다. �
 | **FTP / FTPS 백엔드** — MLSD·REST 기반, 3 OS 공용 | ✅ FTP 서버 대상 통합 테스트 |
 | **네이버 MYBOX 백엔드** — Open API(개인 액세스 토큰), 파일 단위 전송 + 로컬 스테이징 | ✅ 모의 서버 테스트 (실제 계정 확인 대기) |
 | **Google Drive 백엔드** — Drive API v3, OAuth 데스크톱 앱(PKCE·루프백), 범위 읽기 + 재개형 업로드 | ✅ 모의 서버 테스트 (실제 계정 확인 대기) |
-| WebDAV·OneDrive·Dropbox | ⏳ 2차 구현 |
+| **OneDrive 백엔드** — Microsoft Graph, 범위 읽기 + 업로드 세션 | ✅ 모의 서버 테스트 (실제 계정 확인 대기) |
+| **Dropbox 백엔드** — HTTP API v2, 경로 기반, 범위 읽기 + 업로드 세션 | ✅ 모의 서버 테스트 (실제 계정 확인 대기) |
+| WebDAV | ⏳ 2차 구현 |
 
 설계 근거와 라이선스 판단: [docs/DECISIONS.md](docs/DECISIONS.md)
 (검증 결과 전문·내부 구조·로드맵 문서는 아직 작성 전입니다.)
@@ -123,6 +125,11 @@ echo 'mbx_pat_…' | mydrives add mybox --token-stdin --subpath /업무 --mount
 # 2-3) Google Drive 등록 — Google Cloud 콘솔에서 만든 OAuth 클라이언트(데스크톱 앱) ID로 브라우저 로그인
 mydrives add gdrive --client-id '…apps.googleusercontent.com' --client-secret '…' --login --mount
 # 창에서는 "Google 계정으로 로그인" 버튼이 같은 일을 합니다. 토큰은 키체인에, 만료되면 자동 갱신
+
+# 2-4) OneDrive — Entra 앱 등록(모바일 및 데스크톱, 리디렉션 http://localhost)의 클라이언트 ID
+mydrives add onedrive --client-id '<application-id>' --login --mount
+# 2-5) Dropbox — App Console의 앱(리디렉션 http://localhost:53682/)의 App key
+mydrives add dropbox --client-id '<app-key>' --login --mount
 
 # 3) 상태 확인 / 마운트 제어
 mydrives status
@@ -289,7 +296,7 @@ crates/
   mydrives-core/           VFS, inode/핸들, 캐시, 설정, 자격증명, 마운트 매니저
   mydrives-backend-smb/    SMB2/3 백엔드 (순수 Rust)
   mydrives-backend-ftp/    FTP/FTPS 백엔드 (쓰기는 로컬 스테이징 후 한 번에 업로드)
-  mydrives-backend-cloud/  클라우드 백엔드 공통층(id↔경로, 스테이징) + 네이버 MYBOX + Google Drive
+  mydrives-backend-cloud/  클라우드 백엔드 공통층(id↔경로, 스테이징) + MYBOX·Google Drive·OneDrive·Dropbox
   mydrives-mount-windows/  WinFsp 어댑터
   mydrives-mount-nfs/      루프백 NFSv3 서버 (macOS 기본, 커널 익스텐션 불필요)
   mydrives-mount-fuse/     FUSE 어댑터 (Linux, 선택적 macFUSE)

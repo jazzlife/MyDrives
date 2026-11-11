@@ -258,6 +258,67 @@ enum AddKind {
         #[arg(long)]
         mount: bool,
     },
+    /// OneDrive, signed into in the browser with your own app registration
+    /// (Microsoft Entra → App registrations → "Mobile and desktop applications",
+    /// redirect URI http://localhost).
+    Onedrive {
+        /// Drive name. Defaults to the folder mounted, or `OneDrive`.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        /// The application (client) ID of the registration.
+        #[arg(long)]
+        client_id: String,
+        /// Open the browser to sign in now. The tokens go to the OS keychain.
+        #[arg(long)]
+        login: bool,
+        /// Only one folder of the drive, e.g. `/Work`.
+        #[arg(long)]
+        subpath: Option<String>,
+        #[arg(long)]
+        drive: Option<String>,
+        #[arg(long)]
+        mountpoint: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        readonly: bool,
+        #[arg(long)]
+        no_automount: bool,
+        #[arg(long)]
+        mount: bool,
+    },
+    /// Dropbox, signed into in the browser with your own app (Dropbox App
+    /// Console, redirect URI http://localhost:53682/).
+    Dropbox {
+        /// Drive name. Defaults to the folder mounted, or `Dropbox`.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        /// The app key from the App Console.
+        #[arg(long)]
+        client_id: String,
+        /// Open the browser to sign in now. The tokens go to the OS keychain.
+        #[arg(long)]
+        login: bool,
+        /// Only one folder of the Dropbox, e.g. `/Work`.
+        #[arg(long)]
+        subpath: Option<String>,
+        #[arg(long)]
+        drive: Option<String>,
+        #[arg(long)]
+        mountpoint: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        readonly: bool,
+        #[arg(long)]
+        no_automount: bool,
+        #[arg(long)]
+        mount: bool,
+    },
     /// An in-memory test volume, for checking that mounting works at all.
     Mem {
         #[arg(long)]
@@ -768,6 +829,82 @@ async fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<Str
                 mount,
             ))
         }
+        AddKind::Onedrive {
+            id,
+            label,
+            client_id,
+            login,
+            subpath,
+            drive,
+            mountpoint,
+            provider,
+            readonly,
+            no_automount,
+            mount,
+        } => {
+            let oauth = mydrives_core::oauth::microsoft_provider(&client_id);
+            let tokens = sign_in(&oauth, login).await?;
+            let id = id.unwrap_or_else(|| {
+                mydrives_core::naming::cloud_default_id("OneDrive", subpath.as_deref())
+            });
+            Ok((
+                RemoteConfig {
+                    label: label.unwrap_or_default(),
+                    automount: !no_automount,
+                    readonly,
+                    provider,
+                    drive,
+                    mountpoint,
+                    backend: BackendConfig::Onedrive(OAuthConfig {
+                        client_id,
+                        client_secret: None,
+                        subpath,
+                        secret: SecretRef::Keychain,
+                    }),
+                    id,
+                },
+                Some(tokens.to_json()),
+                mount,
+            ))
+        }
+        AddKind::Dropbox {
+            id,
+            label,
+            client_id,
+            login,
+            subpath,
+            drive,
+            mountpoint,
+            provider,
+            readonly,
+            no_automount,
+            mount,
+        } => {
+            let oauth = mydrives_core::oauth::dropbox_provider(&client_id);
+            let tokens = sign_in(&oauth, login).await?;
+            let id = id.unwrap_or_else(|| {
+                mydrives_core::naming::cloud_default_id("Dropbox", subpath.as_deref())
+            });
+            Ok((
+                RemoteConfig {
+                    label: label.unwrap_or_default(),
+                    automount: !no_automount,
+                    readonly,
+                    provider,
+                    drive,
+                    mountpoint,
+                    backend: BackendConfig::Dropbox(OAuthConfig {
+                        client_id,
+                        client_secret: None,
+                        subpath,
+                        secret: SecretRef::Keychain,
+                    }),
+                    id,
+                },
+                Some(tokens.to_json()),
+                mount,
+            ))
+        }
         AddKind::Mem {
             id,
             mountpoint,
@@ -821,4 +958,25 @@ fn human(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// Runs the browser sign-in for an OAuth drive, or says why it cannot.
+async fn sign_in(
+    provider: &mydrives_core::oauth::Provider,
+    login: bool,
+) -> anyhow::Result<mydrives_core::oauth::TokenSet> {
+    if !login {
+        anyhow::bail!(
+            "{} 로그인이 필요합니다: `--login` 을 붙이면 브라우저가 열립니다",
+            provider.name
+        );
+    }
+    eprintln!("브라우저에서 {} 계정으로 로그인하세요…", provider.name);
+    mydrives_core::oauth::authorize(
+        provider,
+        std::time::Duration::from_secs(300),
+        mydrives_core::oauth::open_in_browser,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))
 }

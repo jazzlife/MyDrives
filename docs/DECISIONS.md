@@ -462,3 +462,37 @@ storageQuota`(문자열 int64, limit 없으면 무제한). Google 문서·시트
 검증: OAuth 흐름은 가짜 브라우저(루프백에 직접 요청)와 모의 토큰 서버로 왕복까지,
 Drive 요청 모양은 모의 서버로 시험했습니다. 실제 계정 확인은 사용자의 클라이언트 ID가
 있어야 합니다.
+
+## 13. OneDrive와 Dropbox (2026-11-11)
+
+둘 다 `CloudApi` 구현 하나씩이고 로그인은 §12의 데스크톱 OAuth를 그대로 씁니다.
+다른 점은 리디렉션 URI 규칙뿐이라 `Provider`에 `loopback_host`와 `preferred_port`를
+두었습니다.
+
+**OneDrive (Microsoft Graph v1.0)**: Microsoft는 `http://localhost`만 매칭하고(포트는
+무시, `[::1]`은 미지원, `127.0.0.1`은 포털에서 http로 등록 불가) 그래서 리디렉션은
+`http://localhost:<포트>/`로 보내고 리스너는 127.0.0.1과 `::1` 양쪽에 같은 포트로 엽니다
+(브라우저가 어느 쪽으로 풀든 닿도록). 범위는 `Files.ReadWrite.All offline_access`.
+목록 `GET /me/drive/items/{id}/children`($top 200, `@odata.nextLink`), 루트는
+`/me/drive/root`. 다운로드는 항목의 `@microsoft.graph.downloadUrl`(사전 인증, 수 분
+유효)에 `Range`로 - 토큰은 그 URL에 보내지 않습니다. 업로드는 4 MiB까지
+`PUT …:/{name}:/content`, 그 위는 `createUploadSession`(conflictBehavior replace) 후
+10 MiB(320 KiB의 배수) 조각을 순서대로 `PUT`(토큰 없이). 삭제는 휴지통, 이동은
+`PATCH {parentReference:{id}}`, 이름 변경은 `PATCH {name}`, 용량은 `GET /me/drive?
+$select=quota`. 이름은 대소문자를 가리지 않습니다.
+
+**Dropbox (HTTP API v2)**: 경로 기반이라 **id = 계정 안 경로**(`/Work/x.txt`, 루트는
+빈 문자열). Dropbox는 리디렉션 URI를 포트까지 정확히 맞추므로 포트를 **53682**로
+고정했습니다(rclone과 같은 관례 - 이미 그렇게 등록한 사용자는 그대로 됩니다). 앱에
+시크릿 없이 PKCE, `token_access_type=offline`으로 refresh 토큰. 목록
+`files/list_folder` + `continue`(2000개 단위, `.tag` deleted는 제외), 다운로드
+`content.dropboxapi.com/2/files/download`에 `Dropbox-API-Arg`(비ASCII는 `\uXXXX`로
+이스케이프 - 한글 파일명) + `Range`, 업로드는 100 MiB까지 `files/upload`(mode
+overwrite), 그 위는 `upload_session/start → append_v2 → finish` 8 MiB 조각. 폴더
+`create_folder_v2`, 삭제 `delete_v2`, 이름 변경·이동은 모두 `move_v2`(to_path는
+전체 경로), 용량 `users/get_space_usage`. 오류는 409의 `error_summary`로 구분
+(`not_found`, `conflict`, `insufficient_space`).
+
+검증: 모의 서버로 요청 모양(페이징, 범위 읽기, 토큰 비노출, 업로드 호출, 이동·
+삭제, 용량, 만료 로그인 메시지)을 시험했습니다. 실제 계정 확인은 사용자가 등록한
+앱의 클라이언트 ID가 있어야 합니다.

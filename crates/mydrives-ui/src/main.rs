@@ -215,6 +215,8 @@ enum DriveKind {
     Ftp,
     Mybox,
     Gdrive,
+    Onedrive,
+    Dropbox,
 }
 
 impl DriveKind {
@@ -224,6 +226,8 @@ impl DriveKind {
             DriveKind::Ftp => "FTP",
             DriveKind::Mybox => "네이버 MYBOX",
             DriveKind::Gdrive => "Google Drive",
+            DriveKind::Onedrive => "OneDrive",
+            DriveKind::Dropbox => "Dropbox",
         }
     }
 
@@ -237,20 +241,67 @@ impl DriveKind {
             DriveKind::Gdrive => {
                 "Google Drive를 드라이브로 연결합니다. Google Cloud 콘솔에서 만든 OAuth 클라이언트(데스크톱 앱) ID로 로그인합니다"
             }
+            DriveKind::Onedrive => {
+                "OneDrive를 드라이브로 연결합니다. Microsoft Entra에 등록한 앱(모바일 및 데스크톱, 리디렉션 http://localhost)의 클라이언트 ID로 로그인합니다"
+            }
+            DriveKind::Dropbox => {
+                "Dropbox를 드라이브로 연결합니다. Dropbox App Console에서 만든 앱(리디렉션 http://localhost:53682/)의 앱 키로 로그인합니다"
+            }
         }
     }
 
     /// A service with an account and a token, not a server with an address.
     fn is_cloud(self) -> bool {
-        matches!(self, DriveKind::Mybox | DriveKind::Gdrive)
+        matches!(
+            self,
+            DriveKind::Mybox | DriveKind::Gdrive | DriveKind::Onedrive | DriveKind::Dropbox
+        )
     }
 
     /// Signs in through the browser rather than with a password or token.
     fn uses_oauth(self) -> bool {
-        matches!(self, DriveKind::Gdrive)
+        matches!(self, DriveKind::Gdrive | DriveKind::Onedrive | DriveKind::Dropbox)
     }
 
-    const ALL: [DriveKind; 4] = [DriveKind::Smb, DriveKind::Ftp, DriveKind::Mybox, DriveKind::Gdrive];
+    /// The service's own word for the id the user registers the app under.
+    fn client_id_hint(self) -> &'static str {
+        match self {
+            DriveKind::Gdrive => "Google Cloud 콘솔의 OAuth 클라이언트 ID (…apps.googleusercontent.com)",
+            DriveKind::Onedrive => "Entra 앱 등록의 애플리케이션(클라이언트) ID",
+            DriveKind::Dropbox => "Dropbox App Console의 App key",
+            _ => "",
+        }
+    }
+
+    /// What the sign-in button says.
+    fn login_label(self) -> &'static str {
+        match self {
+            DriveKind::Gdrive => "Google 계정으로 로그인",
+            DriveKind::Onedrive => "Microsoft 계정으로 로그인",
+            DriveKind::Dropbox => "Dropbox 계정으로 로그인",
+            _ => "로그인",
+        }
+    }
+
+    /// The default drive name for a cloud service mounted whole.
+    fn cloud_name(self) -> &'static str {
+        match self {
+            DriveKind::Mybox => "MYBOX",
+            DriveKind::Gdrive => "GoogleDrive",
+            DriveKind::Onedrive => "OneDrive",
+            DriveKind::Dropbox => "Dropbox",
+            _ => "",
+        }
+    }
+
+    const ALL: [DriveKind; 6] = [
+        DriveKind::Smb,
+        DriveKind::Ftp,
+        DriveKind::Mybox,
+        DriveKind::Gdrive,
+        DriveKind::Onedrive,
+        DriveKind::Dropbox,
+    ];
 }
 
 /// 추가 폼. SMB(NAS)와 FTP를 받습니다.
@@ -344,8 +395,14 @@ impl Form {
                 form.kind = DriveKind::Mybox;
                 form.subpath = mybox.subpath.clone().unwrap_or_default();
             }
-            BackendConfig::Gdrive(oauth) => {
-                form.kind = DriveKind::Gdrive;
+            BackendConfig::Gdrive(oauth)
+            | BackendConfig::Onedrive(oauth)
+            | BackendConfig::Dropbox(oauth) => {
+                form.kind = match &cfg.backend {
+                    BackendConfig::Onedrive(_) => DriveKind::Onedrive,
+                    BackendConfig::Dropbox(_) => DriveKind::Dropbox,
+                    _ => DriveKind::Gdrive,
+                };
                 form.subpath = oauth.subpath.clone().unwrap_or_default();
                 form.client_id = oauth.client_id.clone();
                 form.client_secret = oauth.client_secret.clone().unwrap_or_default();
@@ -419,7 +476,7 @@ impl Form {
                     .filter(|leaf| !leaf.is_empty())
                     .unwrap_or(share)
             }
-            DriveKind::Ftp | DriveKind::Mybox | DriveKind::Gdrive => self.subpath.trim().to_string(),
+            _ => self.subpath.trim().to_string(),
         };
         if !self.port_edited {
             self.port = self.default_port().to_string();
@@ -430,12 +487,10 @@ impl Form {
                 DriveKind::Ftp => {
                     mydrives_core::naming::ftp_default_id(self.host.trim(), opt(&self.subpath).as_deref())
                 }
-                DriveKind::Mybox => {
-                    mydrives_core::naming::cloud_default_id("MYBOX", opt(&self.subpath).as_deref())
-                }
-                DriveKind::Gdrive => {
-                    mydrives_core::naming::cloud_default_id("GoogleDrive", opt(&self.subpath).as_deref())
-                }
+                kind => mydrives_core::naming::cloud_default_id(
+                    kind.cloud_name(),
+                    opt(&self.subpath).as_deref(),
+                ),
             };
             // 이름이 겹치면 **기존 드라이브를 덮어씁니다** — id가 설정 키이자
             // 키체인 계정이자 마운트 폴더이기 때문입니다. 겹치지 않는 이름을
@@ -473,7 +528,7 @@ impl Form {
             DriveKind::Ftp if self.security == "implicit" => 990,
             DriveKind::Ftp => 21,
             // HTTPS to the service; there is no port to choose.
-            DriveKind::Mybox | DriveKind::Gdrive => 443,
+            _ => 443,
         }
     }
 
@@ -570,12 +625,19 @@ impl Form {
                     // The token goes to the keychain like a password does.
                     secret: SecretRef::Keychain,
                 }),
-                DriveKind::Gdrive => BackendConfig::Gdrive(OAuthConfig {
-                    client_id: self.client_id.trim().to_string(),
-                    client_secret: opt(&self.client_secret),
-                    subpath: clean_subpath(&self.subpath),
-                    secret: SecretRef::Keychain,
-                }),
+                DriveKind::Gdrive | DriveKind::Onedrive | DriveKind::Dropbox => {
+                    let oauth = OAuthConfig {
+                        client_id: self.client_id.trim().to_string(),
+                        client_secret: opt(&self.client_secret),
+                        subpath: clean_subpath(&self.subpath),
+                        secret: SecretRef::Keychain,
+                    };
+                    match self.kind {
+                        DriveKind::Onedrive => BackendConfig::Onedrive(oauth),
+                        DriveKind::Dropbox => BackendConfig::Dropbox(oauth),
+                        _ => BackendConfig::Gdrive(oauth),
+                    }
+                }
             },
         }
     }
@@ -723,6 +785,8 @@ impl App {
                 &form.client_id,
                 opt(&form.client_secret).as_deref(),
             ),
+            DriveKind::Onedrive => mydrives_core::oauth::microsoft_provider(&form.client_id),
+            DriveKind::Dropbox => mydrives_core::oauth::dropbox_provider(&form.client_id),
             _ => return,
         };
         self.message = None;
@@ -1383,28 +1447,30 @@ impl App {
                             );
                             source_changed |= r.changed();
                         }),
-                        DriveKind::Gdrive => {
-                            // The app the user registered with Google: a Desktop
-                            // app client in their own Cloud project.
+                        DriveKind::Gdrive | DriveKind::Onedrive | DriveKind::Dropbox => {
+                            // The app the user registered with the service; the
+                            // sign-in happens under its name.
                             field(ui, p, "클라이언트 ID", |ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut form.client_id)
-                                        .hint_text("Google Cloud 콘솔의 OAuth 클라이언트 ID (…apps.googleusercontent.com)")
+                                        .hint_text(form.kind.client_id_hint())
                                         .desired_width(260.0),
                                 );
                             });
-                            field(ui, p, "클라이언트 시크릿", |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut form.client_secret)
-                                        .password(true)
-                                        .hint_text("데스크톱 앱이면 있는 그대로 (선택)")
-                                        .desired_width(260.0),
-                                );
-                            });
+                            if form.kind == DriveKind::Gdrive {
+                                field(ui, p, "클라이언트 시크릿", |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut form.client_secret)
+                                            .password(true)
+                                            .hint_text("데스크톱 앱이면 있는 그대로 (선택)")
+                                            .desired_width(260.0),
+                                    );
+                                });
+                            }
                             field(ui, p, "폴더", |ui| {
                                 let r = ui.add(
                                     egui::TextEdit::singleline(&mut form.subpath)
-                                        .hint_text("드라이브 전체를 쓰려면 비워 둠 (예: /Work)")
+                                        .hint_text("전체를 쓰려면 비워 둠 (예: /Work)")
                                         .desired_width(260.0),
                                 );
                                 source_changed |= r.changed();
@@ -1537,7 +1603,7 @@ impl App {
                         field(ui, p, "계정", |ui| {
                             let busy = self.login_call.is_some();
                             let can = !busy && !form.client_id.trim().is_empty();
-                            if secondary(ui, p, "Google 계정으로 로그인", can).clicked() {
+                            if secondary(ui, p, form.kind.login_label(), can).clicked() {
                                 self.start_login(&form);
                             }
                             ui.add_space(8.0);
