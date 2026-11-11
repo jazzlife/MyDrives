@@ -444,6 +444,9 @@ impl Backend for SmbBackend {
             // assume it), even when the underlying filesystem is not.
             case_sensitive: false,
             max_io: 1 << 20,
+            // A share on the local network is cheap to re-read, and someone
+            // else may change it at any moment.
+            metadata_ttl: std::time::Duration::from_secs(10),
         }
     }
 

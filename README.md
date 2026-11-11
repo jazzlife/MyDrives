@@ -37,10 +37,10 @@ Rust 코어 하나에 OS별 마운트 어댑터를 붙이는 구조입니다. �
 | 로그인 시 자동 시작 (LaunchAgent / `Run` 키) | ✅ 양 OS 검증 |
 | 끊김 감지 + 자동 재연결 워치독 | ✅ |
 | **FTP / FTPS 백엔드** — MLSD·REST 기반, 3 OS 공용 | ✅ FTP 서버 대상 통합 테스트 |
-| **네이버 MYBOX 백엔드** — Open API(개인 액세스 토큰), 파일 단위 전송 + 로컬 스테이징 | ✅ 모의 서버 테스트 (실제 계정 확인 대기) |
-| **Google Drive 백엔드** — Drive API v3, OAuth 데스크톱 앱(PKCE·루프백), 범위 읽기 + 재개형 업로드 | ✅ 모의 서버 테스트 (실제 계정 확인 대기) |
-| **OneDrive 백엔드** — Microsoft Graph, 범위 읽기 + 업로드 세션 | ✅ 모의 서버 테스트 (실제 계정 확인 대기) |
-| **Dropbox 백엔드** — HTTP API v2, 경로 기반, 범위 읽기 + 업로드 세션 | ✅ 모의 서버 테스트 (실제 계정 확인 대기) |
+| **네이버 MYBOX 백엔드** — Open API(개인 액세스 토큰), 파일 단위 전송 + 로컬 스테이징 | ✅ 모의 서버 테스트 (OAuth 없음 - 토큰 전용) |
+| **Google Drive 백엔드** — Drive API v3, OAuth 데스크톱 앱(PKCE·루프백), 범위 읽기 + 재개형 업로드 | ✅ 실계정 확인 (로그인·목록·읽기·쓰기·삭제) |
+| **OneDrive 백엔드** — Microsoft Graph, 범위 읽기 + 업로드 세션 | ✅ 실계정 확인 (로그인·목록·읽기·쓰기·삭제) |
+| **Dropbox 백엔드** — HTTP API v2, 경로 기반, 범위 읽기 + 업로드 세션 | ✅ 실계정 확인 (로그인·목록·읽기·쓰기·삭제) |
 | WebDAV | ⏳ 2차 구현 |
 
 설계 근거와 라이선스 판단: [docs/DECISIONS.md](docs/DECISIONS.md)
@@ -122,14 +122,16 @@ echo 'mypassword' | mydrives add ftp \
 echo 'mbx_pat_…' | mydrives add mybox --token-stdin --subpath /업무 --mount
 # 토큰은 30~180일 뒤 만료됩니다. 만료되면 드라이브 편집에서 새 토큰을 넣으세요
 
-# 2-3) Google Drive 등록 — Google Cloud 콘솔에서 만든 OAuth 클라이언트(데스크톱 앱) ID로 브라우저 로그인
-mydrives add gdrive --client-id '…apps.googleusercontent.com' --client-secret '…' --login --mount
-# 창에서는 "Google 계정으로 로그인" 버튼이 같은 일을 합니다. 토큰은 키체인에, 만료되면 자동 갱신
+# 2-3) Google Drive — 버튼 한 번. 릴리스 빌드에는 MyDrives의 OAuth 클라이언트가
+#      들어 있어 로그인만 하면 됩니다
+mydrives add gdrive --login --mount
+# 창에서는 "Google 계정으로 로그인" 버튼이 같은 일을 합니다. 토큰은 키체인에,
+# 만료되면 자동 갱신. 직접 등록한 앱을 쓰려면 --client-id/--client-secret로 덮어씁니다
 
-# 2-4) OneDrive — Entra 앱 등록(모바일 및 데스크톱, 리디렉션 http://localhost)의 클라이언트 ID
-mydrives add onedrive --client-id '<application-id>' --login --mount
-# 2-5) Dropbox — App Console의 앱(리디렉션 http://localhost:53682/)의 App key
-mydrives add dropbox --client-id '<app-key>' --login --mount
+# 2-4) OneDrive
+mydrives add onedrive --login --mount
+# 2-5) Dropbox
+mydrives add dropbox --login --mount
 
 # 3) 상태 확인 / 마운트 제어
 mydrives status

@@ -45,19 +45,111 @@ pub struct Provider {
     pub preferred_port: Option<u16>,
 }
 
-/// Google Drive, for the user's own OAuth client ("Desktop app" in the
-/// Google Cloud console). The id cannot ship inside an open-source binary
-/// without inviting everyone to pose as that app, so the user brings it.
+/// The OAuth client MyDrives itself is registered as with each service.
+///
+/// A sign-in has to happen under *some* registered application, and sending
+/// every user off to make one in three developer consoles is not a sign-in,
+/// it is homework. So the project registers one application per service and
+/// the build compiles the identifiers in, the way every desktop client that
+/// talks to these services does: RFC 8252 says a native app cannot keep a
+/// secret, so these identifiers are not credentials, and PKCE is what
+/// actually protects the exchange.
+///
+/// They are not written in the source, because this repository is public
+/// and Google rotates a client secret it finds in one. The release build
+/// passes them in as environment variables instead; a build without them
+/// leaves the fields empty, and then the window asks the user for a client
+/// of their own exactly as before.
+pub mod builtin {
+    /// What a service needs in order to recognise the app that is asking.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Client {
+        pub client_id: &'static str,
+        pub client_secret: Option<&'static str>,
+    }
+
+    /// A compiled-in value counts only if the build actually supplied one;
+    /// an empty string is what an unset secret expands to in CI.
+    fn set(value: Option<&'static str>) -> Option<&'static str> {
+        match value {
+            Some(v) if !v.trim().is_empty() => Some(v.trim()),
+            _ => None,
+        }
+    }
+
+    pub fn google() -> Option<Client> {
+        set(option_env!("MYDRIVES_GOOGLE_CLIENT_ID")).map(|client_id| Client {
+            client_id,
+            client_secret: set(option_env!("MYDRIVES_GOOGLE_CLIENT_SECRET")),
+        })
+    }
+
+    pub fn microsoft() -> Option<Client> {
+        set(option_env!("MYDRIVES_MICROSOFT_CLIENT_ID")).map(|client_id| Client {
+            client_id,
+            client_secret: None,
+        })
+    }
+
+    pub fn dropbox() -> Option<Client> {
+        set(option_env!("MYDRIVES_DROPBOX_CLIENT_ID")).map(|client_id| Client {
+            client_id,
+            client_secret: None,
+        })
+    }
+
+    /// By the backend kind as it is written in the configuration file.
+    pub fn for_kind(kind: &str) -> Option<Client> {
+        match kind {
+            "gdrive" => google(),
+            "onedrive" => microsoft(),
+            "dropbox" => dropbox(),
+            _ => None,
+        }
+    }
+}
+
+/// Whether signing in to this kind of drive can go ahead with nothing but a
+/// click, because the build knows which application to sign in as.
+pub fn has_builtin_client(kind: &str) -> bool {
+    builtin::for_kind(kind).is_some()
+}
+
+/// Which application to sign in as: the one this drive carries, if it was
+/// given one, and otherwise the one compiled in. A drive that names its own
+/// client keeps using it, so an existing drive does not change hands.
+fn resolve_client(
+    client_id: &str,
+    client_secret: Option<&str>,
+    built: Option<builtin::Client>,
+) -> (String, Option<String>) {
+    let given_secret = client_secret
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let given_id = client_id.trim();
+    if !given_id.is_empty() {
+        return (given_id.to_string(), given_secret);
+    }
+    match built {
+        Some(c) => (
+            c.client_id.to_string(),
+            given_secret.or_else(|| c.client_secret.map(str::to_string)),
+        ),
+        None => (String::new(), given_secret),
+    }
+}
+
+/// Google Drive, as the "Desktop app" OAuth client the build was given,
+/// or as one the user registered themselves and typed into the drive.
 pub fn google_provider(client_id: &str, client_secret: Option<&str>) -> Provider {
+    let (client_id, client_secret) = resolve_client(client_id, client_secret, builtin::google());
     Provider {
         name: "Google",
         auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
         token_url: "https://oauth2.googleapis.com/token".into(),
-        client_id: client_id.trim().to_string(),
-        client_secret: client_secret
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        client_id,
+        client_secret,
         // Everything in the drive, not only files this app made.
         scopes: vec!["https://www.googleapis.com/auth/drive".into()],
         // `offline` is what makes Google hand out a refresh token; `consent`
@@ -77,11 +169,12 @@ pub fn google_provider(client_id: &str, client_secret: Option<&str>) -> Provider
 /// the port for localhost and does not support `[::1]`, so the redirect
 /// names `localhost` and the listener takes care to be reachable there.
 pub fn microsoft_provider(client_id: &str) -> Provider {
+    let (client_id, _) = resolve_client(client_id, None, builtin::microsoft());
     Provider {
         name: "Microsoft",
         auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize".into(),
         token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token".into(),
-        client_id: client_id.trim().to_string(),
+        client_id,
         client_secret: None,
         // `offline_access` is what makes Microsoft hand out a refresh token.
         scopes: vec!["Files.ReadWrite.All".into(), "offline_access".into()],
@@ -99,11 +192,12 @@ pub const DROPBOX_PORT: u16 = 53682;
 /// Dropbox, for an app made in the Dropbox App Console with the redirect
 /// URI `http://localhost:53682/`. Dropbox apps have no secret for PKCE.
 pub fn dropbox_provider(client_id: &str) -> Provider {
+    let (client_id, _) = resolve_client(client_id, None, builtin::dropbox());
     Provider {
         name: "Dropbox",
         auth_url: "https://www.dropbox.com/oauth2/authorize".into(),
         token_url: "https://api.dropboxapi.com/oauth2/token".into(),
-        client_id: client_id.trim().to_string(),
+        client_id,
         client_secret: None,
         // Dropbox scopes are set on the app, not asked for here.
         scopes: vec![],
@@ -250,6 +344,14 @@ pub async fn authorize(
     timeout: Duration,
     open: impl FnOnce(&str) -> Result<()>,
 ) -> Result<TokenSet> {
+    // Without an application to sign in as there is nothing to open: this
+    // build shipped no client for the service and the drive brought none.
+    if provider.client_id.trim().is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "{}에 로그인할 앱 정보가 없습니다 - 이 빌드에는 {} 클라이언트가 들어 있지 않으니 클라이언트 ID를 넣으세요",
+            provider.name, provider.name
+        )));
+    }
     // The preferred port first (a service that matches the registered port
     // needs it), any free port otherwise.
     let listener = match provider.preferred_port {
@@ -622,5 +724,42 @@ mod tests {
         assert!(stale.expires_within(Duration::from_secs(60)));
         let back = TokenSet::from_json(&fresh.to_json()).unwrap();
         assert_eq!(back, fresh);
+    }
+}
+
+#[cfg(test)]
+mod builtin_tests {
+    use super::*;
+
+    const SHIPPED: Option<builtin::Client> = Some(builtin::Client {
+        client_id: "shipped.apps.googleusercontent.com",
+        client_secret: Some("shipped-secret"),
+    });
+
+    #[test]
+    fn a_drive_without_a_client_signs_in_as_the_one_the_build_shipped() {
+        let (id, secret) = resolve_client("", None, SHIPPED);
+        assert_eq!(id, "shipped.apps.googleusercontent.com");
+        assert_eq!(secret.as_deref(), Some("shipped-secret"));
+    }
+
+    #[test]
+    fn a_drive_that_brought_its_own_client_keeps_it() {
+        let (id, secret) = resolve_client("  mine  ", Some(" mine-secret "), SHIPPED);
+        assert_eq!(id, "mine");
+        assert_eq!(secret.as_deref(), Some("mine-secret"));
+    }
+
+    #[test]
+    fn nothing_shipped_and_nothing_given_leaves_the_client_empty() {
+        let (id, secret) = resolve_client("   ", Some("   "), None);
+        assert!(id.is_empty(), "{id}");
+        assert_eq!(secret, None);
+    }
+
+    #[test]
+    fn a_service_without_a_shipped_client_is_asked_for_one() {
+        assert!(!has_builtin_client("smb"));
+        assert_eq!(builtin::for_kind("ftp"), None);
     }
 }

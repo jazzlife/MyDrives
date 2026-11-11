@@ -704,6 +704,9 @@ impl<T: Transport> Backend for FtpBackend<T> {
             rename_replace: false,
             case_sensitive: true,
             max_io: 1 << 20,
+            // A share on the local network is cheap to re-read, and someone
+            // else may change it at any moment.
+            metadata_ttl: std::time::Duration::from_secs(10),
         }
     }
 

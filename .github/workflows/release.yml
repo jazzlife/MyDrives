@@ -144,6 +144,14 @@ jobs:
           # refuses to answer across architectures unless told to. FUSE-T's
           # dylib carries both, so the answer is the same either way.
           PKG_CONFIG_ALLOW_CROSS: "1"
+          # The OAuth applications MyDrives signs users in as. They are not in
+          # the source because this repository is public; a build without them
+          # (a fork, or a clone with no secrets) still works and asks the user
+          # for a client of their own instead.
+          MYDRIVES_GOOGLE_CLIENT_ID: ${{ secrets.MYDRIVES_GOOGLE_CLIENT_ID }}
+          MYDRIVES_GOOGLE_CLIENT_SECRET: ${{ secrets.MYDRIVES_GOOGLE_CLIENT_SECRET }}
+          MYDRIVES_MICROSOFT_CLIENT_ID: ${{ secrets.MYDRIVES_MICROSOFT_CLIENT_ID }}
+          MYDRIVES_DROPBOX_CLIENT_ID: ${{ secrets.MYDRIVES_DROPBOX_CLIENT_ID }}
         run: |
           for target in ${{ matrix.targets }}; do
             cargo build --release --features ${{ matrix.features }} --target "$target" \

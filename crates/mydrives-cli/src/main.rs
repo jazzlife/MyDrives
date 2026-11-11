@@ -230,8 +230,9 @@ enum AddKind {
         id: Option<String>,
         #[arg(long)]
         label: Option<String>,
-        /// The OAuth client ID (`…apps.googleusercontent.com`).
-        #[arg(long)]
+        /// The OAuth client ID (`…apps.googleusercontent.com`). Optional:
+        /// builds that ship their own application sign in as that one.
+        #[arg(long, default_value = "")]
         client_id: String,
         /// The client secret Google shows next to it (optional for desktop apps).
         #[arg(long)]
@@ -267,8 +268,9 @@ enum AddKind {
         id: Option<String>,
         #[arg(long)]
         label: Option<String>,
-        /// The application (client) ID of the registration.
-        #[arg(long)]
+        /// The application (client) ID of the registration. Optional:
+        /// builds that ship their own application sign in as that one.
+        #[arg(long, default_value = "")]
         client_id: String,
         /// Open the browser to sign in now. The tokens go to the OS keychain.
         #[arg(long)]
@@ -297,8 +299,9 @@ enum AddKind {
         id: Option<String>,
         #[arg(long)]
         label: Option<String>,
-        /// The app key from the App Console.
-        #[arg(long)]
+        /// The app key from the App Console. Optional: builds that ship
+        /// their own application sign in as that one.
+        #[arg(long, default_value = "")]
         client_id: String,
         /// Open the browser to sign in now. The tokens go to the OS keychain.
         #[arg(long)]

@@ -254,6 +254,15 @@ struct Allocation {
     allocated: u64,
 }
 
+/// The names Dropbox refuses to store, as its documentation lists them.
+/// Checking here turns a doomed upload at close into a refusal the moment
+/// the file is made, which is what a filesystem is supposed to say.
+fn disallowed_name(name: &str) -> bool {
+    const NEVER: [&str; 5] = [".ds_store", "desktop.ini", "thumbs.db", ".dropbox", ".dropbox.attr"];
+    let lower = name.to_ascii_lowercase();
+    NEVER.contains(&lower.as_str()) || lower.ends_with('~') || lower.starts_with("icon\r")
+}
+
 fn join(parent: &str, name: &str) -> String {
     format!("{}/{}", parent.trim_end_matches('/'), name)
 }
@@ -428,6 +437,14 @@ impl CloudApi for DropboxApi {
         len: u64,
         _modified: Option<SystemTime>,
     ) -> Result<()> {
+        // Dropbox rejects a handful of names outright. Finder drops a
+        // .DS_Store into every folder it opens, so without this every
+        // browse ended in a failed upload the user could see.
+        if disallowed_name(name) {
+            return Err(Error::PermissionDenied(format!(
+                "Dropbox는 '{name}'이라는 이름을 받지 않습니다"
+            )));
+        }
         let commit = serde_json::json!({
             "path": join(parent, name),
             "mode": "overwrite",

@@ -30,12 +30,20 @@ const SELECT: &str = "id,name,size,file,folder,lastModifiedDateTime,createdDateT
 const SIMPLE_UPLOAD_MAX: u64 = 4 * 1024 * 1024;
 /// 32 × 320 KiB, inside Graph's 60 MiB ceiling for one fragment.
 const FRAGMENT: u64 = 10 * 1024 * 1024;
+/// How long a fetched download URL is reused. Graph says roughly an hour;
+/// well short of that keeps a read from ever meeting an expired one.
+const DOWNLOAD_URL_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 pub struct OnedriveApi {
     http: reqwest::Client,
     base: String,
     session: Arc<Session>,
     subpath: Option<String>,
+    /// Download URLs already fetched, by item id. Graph hands out a
+    /// pre-authenticated URL that stays good for about an hour; asking for a
+    /// fresh one before every chunk doubled the requests a read costs and
+    /// put a round trip in front of each megabyte.
+    downloads: std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
 }
 
 impl OnedriveApi {
@@ -54,6 +62,7 @@ impl OnedriveApi {
             base: base.trim_end_matches('/').to_string(),
             session,
             subpath,
+            downloads: Default::default(),
         }
     }
 
@@ -102,20 +111,54 @@ impl OnedriveApi {
     }
 
     /// The pre-authenticated URL for a file's bytes, good for a few minutes.
+    ///
+    /// Asked for as the whole item on purpose. The download URL is a
+    /// computed property: Graph puts it in the default representation, but
+    /// naming it in a `$select` list leaves it out of the answer, which read
+    /// as "this item has no download" on every file (seen against a real
+    /// drive on 2026-11-11, while the mock had been happy to return it).
     async fn download_url(&self, id: &str) -> Result<String> {
+        if let Some(url) = self.cached_download(id) {
+            return Ok(url);
+        }
         let item: DownloadInfo = self
-            .json(
-                || {
-                    self.http
-                        .get(self.item_url(id, ""))
-                        .query(&[("$select", "id,@microsoft.graph.downloadUrl")])
-                },
-                "다운로드 URL",
-            )
+            .json(|| self.http.get(self.item_url(id, "")), "다운로드 URL")
             .await?;
-        item.download_url
-            .ok_or_else(|| Error::Backend("OneDrive 다운로드 URL: 파일이 아니거나 내려받을 수 없습니다".into()))
+        let url = item.download_url.ok_or_else(|| {
+            Error::Backend("OneDrive 다운로드 URL: 파일이 아니거나 내려받을 수 없습니다".into())
+        })?;
+        if let Ok(mut cache) = self.downloads.lock() {
+            cache.insert(id.to_string(), (url.clone(), std::time::Instant::now()));
+        }
+        Ok(url)
     }
+
+    fn cached_download(&self, id: &str) -> Option<String> {
+        let cache = self.downloads.lock().ok()?;
+        let (url, made) = cache.get(id)?;
+        (made.elapsed() < DOWNLOAD_URL_TTL).then(|| url.clone())
+    }
+
+    /// Throws away a URL the service no longer honours, so the next read
+    /// fetches a fresh one instead of failing again.
+    fn forget_download(&self, id: &str) {
+        if let Ok(mut cache) = self.downloads.lock() {
+            cache.remove(id);
+        }
+    }
+}
+
+/// Whether a refusal looks like the pre-authenticated URL having expired
+/// rather than the file being gone: the CDN answers these without ever
+/// reaching the drive.
+fn stale_url(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::GONE
+    )
 }
 
 async fn check(response: reqwest::Response, what: &str) -> Result<reqwest::Response> {
@@ -277,7 +320,7 @@ impl CloudApi for OnedriveApi {
                         None => self
                             .http
                             .get(self.item_url(folder, "/children"))
-                            .query(&[("$select", SELECT), ("$top", "200")]),
+                            .query(&[("$select", SELECT), ("$top", "999")]),
                     },
                     "목록",
                 )
@@ -361,18 +404,40 @@ impl CloudApi for OnedriveApi {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let url = self.download_url(id).await?;
         let range = format!("bytes={}-{}", offset, offset + len as u64 - 1);
-        let response = check(
-            self.http
+        // A cached URL can age out between reads. One refused attempt is
+        // worth retrying with a freshly fetched URL; a second failure is
+        // the service talking, not our cache.
+        let mut response = None;
+        for attempt in 0..2 {
+            let url = self.download_url(id).await?;
+            let sent = self
+                .http
                 .get(&url)
-                .header(reqwest::header::RANGE, range)
+                .header(reqwest::header::RANGE, range.clone())
                 .send()
                 .await
-                .map_err(|e| transport_error(e, "읽기"))?,
-            "읽기",
-        )
-        .await?;
+                .map_err(|e| transport_error(e, "읽기"))?;
+            if attempt == 0 && stale_url(sent.status()) {
+                self.forget_download(id);
+                continue;
+            }
+            response = Some(check(sent, "읽기").await?);
+            break;
+        }
+        let response = match response {
+            Some(r) => r,
+            None => check(
+                self.http
+                    .get(&self.download_url(id).await?)
+                    .header(reqwest::header::RANGE, range)
+                    .send()
+                    .await
+                    .map_err(|e| transport_error(e, "읽기"))?,
+                "읽기",
+            )
+            .await?,
+        };
         let whole = response.status() == reqwest::StatusCode::OK;
         let bytes = response
             .bytes()

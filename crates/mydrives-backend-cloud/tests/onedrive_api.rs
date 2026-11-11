@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use wiremock::matchers::{body_partial_json, header, method, path, query_param};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use mydrives_backend_cloud::onedrive::OnedriveApi;
@@ -88,7 +88,8 @@ async fn a_range_read_goes_to_the_download_url_without_the_token() {
     let dl = format!("{}/dl/A1", server.uri());
     Mock::given(method("GET"))
         .and(path("/me/drive/items/A1"))
-        .and(query_param("$select", "id,@microsoft.graph.downloadUrl"))
+        // No $select: naming the download URL there makes Graph omit it.
+        .and(move |req: &Request| !req.url.query_pairs().any(|(k, _)| k == "$select"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "A1", "@microsoft.graph.downloadUrl": dl
         })))

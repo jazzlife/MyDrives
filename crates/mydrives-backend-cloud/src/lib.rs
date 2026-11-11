@@ -123,10 +123,19 @@ pub trait CloudApi: Send + Sync + 'static {
     async fn quota(&self) -> Result<FsStat>;
 }
 
-/// How long a folder listing is trusted for turning names into ids. The VFS
-/// above has its own cache for attributes; this one exists so that a path
-/// deep in the tree does not list every folder on the way down twice.
-const LISTING_TTL: Duration = Duration::from_secs(10);
+/// How long a folder listing is reused, for turning names into ids and for
+/// the attributes the VFS above hands out.
+///
+/// Every miss is a round trip over the internet, and Finder re-reads a
+/// folder it is showing far more often than the folder changes. Ten
+/// seconds meant a window left open re-listed itself all day.
+const LISTING_TTL: Duration = Duration::from_secs(60);
+
+/// How much is fetched when a read misses the block already in hand.
+///
+/// Big enough that an ordinary file arrives in one request, small enough
+/// that several open files do not add up to much memory.
+const READ_AHEAD: u32 = 4 * 1024 * 1024;
 
 struct Listing {
     items: Arc<Vec<Item>>,
@@ -141,6 +150,37 @@ struct OpenFile {
     /// downloading before the first write.
     starts_empty: bool,
     staged: tokio::sync::Mutex<Option<Staged>>,
+    /// The last block fetched for this handle, to answer the reads that
+    /// follow it without going back to the service.
+    ahead: tokio::sync::Mutex<Option<Block>>,
+}
+
+/// A run of bytes read from the service and kept for the reads that come
+/// next.
+///
+/// The kernel asks for a file in pieces far smaller than a sensible HTTP
+/// request - around 48 KiB over NFS - so reading a 1 MB photo straight
+/// through cost two dozen round trips and most of a minute on a drive
+/// across the internet. One request of [`READ_AHEAD`] covers the lot.
+struct Block {
+    at: u64,
+    bytes: Vec<u8>,
+}
+
+impl Block {
+    /// The part of this block answering `offset..offset + len`, if it holds
+    /// all of it. A partial hit is not worth splicing: the next fetch will
+    /// cover it.
+    fn slice(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
+        let start = offset.checked_sub(self.at)? as usize;
+        let end = start.checked_add(len as usize)?;
+        if start > self.bytes.len() {
+            return None;
+        }
+        // Short at the end means end of file, which is an answer too.
+        let end = end.min(self.bytes.len());
+        (end >= start).then(|| self.bytes[start..end].to_vec())
+    }
 }
 
 /// A filesystem over a [`CloudApi`].
@@ -304,6 +344,7 @@ impl<A: CloudApi> CloudBackend<A> {
                 opts,
                 starts_empty,
                 staged: tokio::sync::Mutex::new(None),
+                ahead: tokio::sync::Mutex::new(None),
             }),
         );
         BFile(id)
@@ -381,6 +422,7 @@ impl<A: CloudApi> Backend for CloudBackend<A> {
             rename_replace: false,
             case_sensitive: self.api.caps().case_sensitive,
             max_io: 1 << 20,
+            metadata_ttl: LISTING_TTL,
         }
     }
 
@@ -486,7 +528,20 @@ impl<A: CloudApi> Backend for CloudBackend<A> {
                 return Ok(Vec::new());
             }
             let want = len.min((item.size - offset) as u32);
-            return self.api.download_range(&item.id, offset, want).await;
+            // Serve from the block already fetched when it reaches far
+            // enough; otherwise fetch a run starting here and keep it.
+            let mut ahead = file.ahead.lock().await;
+            if let Some(hit) = ahead.as_ref().and_then(|b| b.slice(offset, want)) {
+                return Ok(hit);
+            }
+            let reach = READ_AHEAD.max(want).min((item.size - offset) as u32);
+            let block = Block {
+                at: offset,
+                bytes: self.api.download_range(&item.id, offset, reach).await?,
+            };
+            let answer = block.slice(offset, want).unwrap_or_default();
+            *ahead = Some(block);
+            return Ok(answer);
         }
         self.stage(&file, &mut slot).await?;
         let staged = slot.as_mut().expect("staged just above");

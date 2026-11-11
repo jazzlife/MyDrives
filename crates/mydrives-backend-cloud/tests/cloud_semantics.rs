@@ -307,8 +307,10 @@ async fn a_service_with_range_reads_is_read_without_a_local_copy() {
     b.connect().await.unwrap();
     write_file(&b, "/r.txt", b"abcdefghijklmnopqrstuvwxyz").await;
     assert_eq!(read_all(&b, "/r.txt").await, b"abcdefghijklmnopqrstuvwxyz");
-    // 26 bytes in reads of 7: four range downloads, no whole-file fetch.
-    assert_eq!(calls.downloads.load(Ordering::Relaxed), 4);
+    // Read in pieces of 7 and fetched in one run. The pieces the kernel
+    // asks for are far smaller than a worthwhile HTTP request, so the first
+    // read takes the whole read-ahead window and the rest come out of it.
+    assert_eq!(calls.downloads.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]

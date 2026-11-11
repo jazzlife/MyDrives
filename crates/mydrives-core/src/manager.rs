@@ -323,10 +323,15 @@ impl MountManager {
         }
         let provider = mount::select(&self.providers, cfg.provider.as_deref(), &target)?;
 
+        // The backend knows how dear its metadata is to fetch; a cloud
+        // service asks for a longer memory than a share on the LAN.
+        let ttl = backend.caps().metadata_ttl;
         let vfs = Vfs::new(
             backend.clone(),
             VfsOptions {
                 readonly: cfg.readonly,
+                attr_ttl: ttl,
+                dir_ttl: ttl,
                 ..Default::default()
             },
         );

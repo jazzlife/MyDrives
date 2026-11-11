@@ -162,6 +162,13 @@ pub struct Caps {
     pub case_sensitive: bool,
     /// Largest read/write the backend handles well in one call.
     pub max_io: u32,
+    /// How long listings and attributes may be reused before asking again.
+    ///
+    /// A share on the local network is cheap to re-read and may be changed
+    /// by someone else at any moment, so it stays short. A cloud drive is a
+    /// round trip over the internet for every miss, and Finder asks
+    /// constantly while a window is open.
+    pub metadata_ttl: Duration,
 }
 
 impl Default for Caps {
@@ -173,6 +180,7 @@ impl Default for Caps {
             rename_replace: true,
             case_sensitive: false,
             max_io: 1 << 20,
+            metadata_ttl: Duration::from_secs(10),
         }
     }
 }

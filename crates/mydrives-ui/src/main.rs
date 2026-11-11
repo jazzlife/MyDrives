@@ -27,6 +27,12 @@ use mydrives_ipc::{Request, Response, UpdateAction};
 
 use theme::Palette;
 
+/// Naver documents one way to authenticate against the MYBOX Open API: a
+/// personal access token made on the MYBOX web settings page. There is no
+/// OAuth client to sign in as, so the window links the page that walks a
+/// user through issuing one.
+const MYBOX_TOKEN_GUIDE: &str = "https://developers.mybox.naver.com/getting-started";
+
 const REFRESH: Duration = Duration::from_millis(1500);
 const SIDEBAR_WIDTH: f32 = 236.0;
 const ROW_HEIGHT: f32 = 48.0;
@@ -238,6 +244,15 @@ impl DriveKind {
             DriveKind::Mybox => {
                 "네이버 MYBOX를 드라이브로 연결합니다. MYBOX 웹 설정 → 계정 및 개인 액세스 토큰 관리에서 만든 토큰이 필요합니다"
             }
+            DriveKind::Gdrive if !self.needs_client_id() => {
+                "Google Drive를 드라이브로 연결합니다. 버튼을 누르면 브라우저에서 Google 계정으로 로그인합니다"
+            }
+            DriveKind::Onedrive if !self.needs_client_id() => {
+                "OneDrive를 드라이브로 연결합니다. 버튼을 누르면 브라우저에서 Microsoft 계정으로 로그인합니다"
+            }
+            DriveKind::Dropbox if !self.needs_client_id() => {
+                "Dropbox를 드라이브로 연결합니다. 버튼을 누르면 브라우저에서 Dropbox 계정으로 로그인합니다"
+            }
             DriveKind::Gdrive => {
                 "Google Drive를 드라이브로 연결합니다. Google Cloud 콘솔에서 만든 OAuth 클라이언트(데스크톱 앱) ID로 로그인합니다"
             }
@@ -261,6 +276,30 @@ impl DriveKind {
     /// Signs in through the browser rather than with a password or token.
     fn uses_oauth(self) -> bool {
         matches!(self, DriveKind::Gdrive | DriveKind::Onedrive | DriveKind::Dropbox)
+    }
+
+    /// The kind as the configuration file spells it.
+    fn config_kind(self) -> &'static str {
+        match self {
+            DriveKind::Smb => "smb",
+            DriveKind::Ftp => "ftp",
+            DriveKind::Mybox => "mybox",
+            DriveKind::Gdrive => "gdrive",
+            DriveKind::Onedrive => "onedrive",
+            DriveKind::Dropbox => "dropbox",
+        }
+    }
+
+    /// Whether this build knows which application to sign in as, so the
+    /// user only has to click the button.
+    fn has_builtin_client(self) -> bool {
+        mydrives_core::oauth::has_builtin_client(self.config_kind())
+    }
+
+    /// Whether the window still has to ask for an application of the
+    /// user's own before it can sign in.
+    fn needs_client_id(self) -> bool {
+        self.uses_oauth() && !self.has_builtin_client()
     }
 
     /// The service's own word for the id the user registers the app under.
@@ -540,7 +579,7 @@ impl Form {
             return Err("드라이브 이름을 입력하세요");
         }
         if self.kind.is_cloud() {
-            if self.kind.uses_oauth() && self.client_id.trim().is_empty() {
+            if self.kind.needs_client_id() && self.client_id.trim().is_empty() {
                 return Err("OAuth 클라이언트 ID를 입력하세요");
             }
             // The token (or the sign-in) is the whole credential. Editing may
@@ -1448,24 +1487,27 @@ impl App {
                             source_changed |= r.changed();
                         }),
                         DriveKind::Gdrive | DriveKind::Onedrive | DriveKind::Dropbox => {
-                            // The app the user registered with the service; the
-                            // sign-in happens under its name.
-                            field(ui, p, "클라이언트 ID", |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut form.client_id)
-                                        .hint_text(form.kind.client_id_hint())
-                                        .desired_width(260.0),
-                                );
-                            });
-                            if form.kind == DriveKind::Gdrive {
-                                field(ui, p, "클라이언트 시크릿", |ui| {
+                            // The application the sign-in happens under. A
+                            // build that ships one does not mention it at
+                            // all - the user only sees the login button.
+                            if form.kind.needs_client_id() {
+                                field(ui, p, "클라이언트 ID", |ui| {
                                     ui.add(
-                                        egui::TextEdit::singleline(&mut form.client_secret)
-                                            .password(true)
-                                            .hint_text("데스크톱 앱이면 있는 그대로 (선택)")
+                                        egui::TextEdit::singleline(&mut form.client_id)
+                                            .hint_text(form.kind.client_id_hint())
                                             .desired_width(260.0),
                                     );
                                 });
+                                if form.kind == DriveKind::Gdrive {
+                                    field(ui, p, "클라이언트 시크릿", |ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut form.client_secret)
+                                                .password(true)
+                                                .hint_text("데스크톱 앱이면 있는 그대로 (선택)")
+                                                .desired_width(260.0),
+                                        );
+                                    });
+                                }
                             }
                             field(ui, p, "폴더", |ui| {
                                 let r = ui.add(
@@ -1602,7 +1644,9 @@ impl App {
                         // leaves land in `password` as JSON and are stored like one.
                         field(ui, p, "계정", |ui| {
                             let busy = self.login_call.is_some();
-                            let can = !busy && !form.client_id.trim().is_empty();
+                            let can = !busy
+                                && (!form.client_id.trim().is_empty()
+                                    || !form.kind.needs_client_id());
                             if secondary(ui, p, form.kind.login_label(), can).clicked() {
                                 self.start_login(&form);
                             }
@@ -1613,7 +1657,9 @@ impl App {
                                 "로그인됨"
                             } else if form.editing {
                                 "저장된 로그인 유지 (바꾸려면 다시 로그인)"
-                            } else if form.client_id.trim().is_empty() {
+                            } else if form.kind.needs_client_id()
+                                && form.client_id.trim().is_empty()
+                            {
                                 "클라이언트 ID를 먼저 적으세요"
                             } else {
                                 "아직 로그인하지 않음"
@@ -1638,6 +1684,18 @@ impl App {
                                 .hint_text(hint)
                                 .desired_width(260.0),
                         );
+                        // MYBOX has no browser sign-in to offer (the Open API
+                        // takes a personal access token and nothing else), so
+                        // the next best thing is not making the user hunt for
+                        // the page that issues one.
+                        if form.kind == DriveKind::Mybox {
+                            ui.add_space(8.0);
+                            if secondary(ui, p, "토큰 발급 방법", true).clicked() {
+                                let _ = mydrives_core::oauth::open_in_browser(
+                                    MYBOX_TOKEN_GUIDE,
+                                );
+                            }
+                        }
                     });
                     }
                     if cfg!(windows) {
