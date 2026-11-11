@@ -313,6 +313,20 @@ async fn a_service_with_range_reads_is_read_without_a_local_copy() {
     assert_eq!(calls.downloads.load(Ordering::Relaxed), 1);
 }
 
+/// A file bigger than the read-ahead window is read through more than one
+/// block, and the bytes at the seam have to be the file.s own. Serving
+/// whatever the first block happened to hold returned a short read, which
+/// the layers above take at face value: a 5 MB file came back corrupt.
+#[tokio::test]
+async fn a_file_larger_than_the_read_ahead_window_comes_back_whole() {
+    let (b, _calls) = drive(true);
+    b.connect().await.unwrap();
+    // Distinct bytes so a misplaced seam cannot go unnoticed.
+    let data: Vec<u8> = (0..5_000_000u32).map(|i| (i % 251) as u8).collect();
+    write_file(&b, "/big.bin", &data).await;
+    assert_eq!(read_all(&b, "/big.bin").await, data);
+}
+
 #[tokio::test]
 async fn folders_list_what_is_in_them_and_paths_resolve_through_ids() {
     let (b, calls) = drive(false);

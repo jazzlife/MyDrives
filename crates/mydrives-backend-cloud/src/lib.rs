@@ -168,18 +168,17 @@ struct Block {
 }
 
 impl Block {
-    /// The part of this block answering `offset..offset + len`, if it holds
-    /// all of it. A partial hit is not worth splicing: the next fetch will
-    /// cover it.
+    /// The part of this block answering `offset..offset + len`, but only if
+    /// it holds **all** of it.
+    ///
+    /// Returning what it happens to have would be a short read, and a short
+    /// read is not an error the layers above check for - they take it as the
+    /// bytes that were there. A 5 MB file read through a 4 MiB window came
+    /// back corrupt at the seam until this insisted on the whole range.
     fn slice(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
         let start = offset.checked_sub(self.at)? as usize;
         let end = start.checked_add(len as usize)?;
-        if start > self.bytes.len() {
-            return None;
-        }
-        // Short at the end means end of file, which is an answer too.
-        let end = end.min(self.bytes.len());
-        (end >= start).then(|| self.bytes[start..end].to_vec())
+        (end <= self.bytes.len()).then(|| self.bytes[start..end].to_vec())
     }
 }
 

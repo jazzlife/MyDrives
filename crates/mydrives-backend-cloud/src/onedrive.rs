@@ -470,6 +470,10 @@ impl CloudApi for OnedriveApi {
                     self.http
                         .put(&url)
                         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                        // Spelled out because Graph answers 411 when a PUT
+                        // arrives without one, which is what an emptied file
+                        // (truncate, then close) looked like.
+                        .header(reqwest::header::CONTENT_LENGTH, data.len())
                         .body(data.clone())
                 },
                 "업로드",
