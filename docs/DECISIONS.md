@@ -360,3 +360,12 @@ plist)을 직접 읽고 씁니다. 즐겨찾기(FavoriteItems)에 넣은 항목�
 앱이 바꾸지 않고, 사용자가 켜고 끕니다. 고정 항목은 Bonjour 이름이 같게 유지되면
 `/Volumes` 아래에서도 재마운트를 견딥니다(실측). 깨졌던 것은 이름이 `QNAP-1`로 바뀐
 탓이었고, 홈 아래 폴더는 경로로 풀리므로 이름과 무관하게 견딥니다.
+
+**항목 하나만 갱신하는 API는 Apple 전용** (2026-11-11 확인). Finder는 공개
+`LSSharedFileList*` API로 사이드바 항목을 넣고 빼며 `sharedfilelistd`가 변경을 즉시
+알립니다. 그런데 `sharedfilelistd`는 `com.apple.private.coreservices.canaccessanysharedfilelist`
+entitlement를 검사하고, 없는 프로세스에는 빈 목록을 주고 쓰기를 버립니다(C로 호출,
+GUI 세션·LaunchAgent·osascript 모두 0개, 파일 불변, 로그 "missing entitlement").
+서드파티는 이 entitlement를 받을 수 없으므로 파일 직접 쓰기 + Finder 재시작이 유일한
+길입니다. 재시작은 항목이 실제로 바뀔 때(드라이브 추가 후 첫 연결·삭제·폴더 이동)만
+일어나며, 사용자 결정으로 이대로 둡니다.
