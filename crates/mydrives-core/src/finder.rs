@@ -26,13 +26,14 @@ use crate::error::Result;
 
 /// Pin the volume at `mountpoint` to the sidebar. `Ok(true)` when the list
 /// changed (and Finder was restarted), `Ok(false)` when it was already there.
-pub fn pin_volume(mountpoint: &Path) -> Result<bool> {
+pub fn pin_volume(mountpoint: &Path, name: &str) -> Result<bool> {
     #[cfg(target_os = "macos")]
     {
-        macos::pin(mountpoint)
+        macos::pin(mountpoint, name)
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = name;
         Ok(false)
     }
 }
@@ -67,12 +68,28 @@ mod macos {
         Ok(PathBuf::from(home).join(LIST_DIR).join(name))
     }
 
-    pub fn pin(mountpoint: &Path) -> Result<bool> {
+    pub fn pin(mountpoint: &Path, name: &str) -> Result<bool> {
+        // One pin at a time. Each one reads the list, appends and writes it
+        // back, so two mounts finishing together used to lose an entry.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // The row's label comes out of the bookmark, and a bookmark made
+        // before the mount is live describes the disk the folder sits on -
+        // which is why every drive once read "Macintosh HD". Wait for the
+        // mount to show up, and skip the pin rather than record the wrong
+        // volume. (The list carries no name of its own: adding a `Name` key
+        // makes macOS reject the whole file and the sidebar falls back to
+        // its defaults. Tried on 2026-11-11.)
+        let _ = name;
+        if !wait_until_mounted(mountpoint) {
+            return Ok(false);
+        }
         let wanted = normalize(mountpoint);
         // Already pinned - in either list - means nothing to do, and no
         // Finder restart.
-        for name in [LOCATIONS, FAVORITES] {
-            if let Some(list) = read_list(name)? {
+        for list_name in [LOCATIONS, FAVORITES] {
+            if let Some(list) = read_list(list_name)? {
                 if list.items().any(|item| item_points_at(item, &wanted)) {
                     return Ok(false);
                 }
@@ -100,6 +117,27 @@ mod macos {
         write_list(FAVORITES, &list)?;
         restart_finder();
         Ok(true)
+    }
+
+    /// Whether `path` is its own volume yet, giving the mount a moment to
+    /// appear. A mount point differs from its parent in device number.
+    fn wait_until_mounted(path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        for attempt in 0..20 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            let (Ok(here), Ok(up)) = (std::fs::metadata(path), std::fs::metadata(parent)) else {
+                continue;
+            };
+            if here.dev() != up.dev() {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn unpin(mountpoint: &Path) -> Result<bool> {

@@ -265,7 +265,7 @@ impl MountManager {
                 }
                 self.spawn_watchdog(id, &mountpoint);
                 tracing::info!(remote = id, mountpoint = %mountpoint, provider, "mounted");
-                pin_to_sidebar(id, &mountpoint);
+                pin_to_sidebar(id, cfg.display_label(), &mountpoint);
                 Ok(mountpoint)
             }
             Err(e) => {
@@ -601,13 +601,14 @@ fn create_mount_point(path: &std::path::Path, sudo_mount: bool) -> Result<()> {
 /// cheap when the drive is already there, and the first time it has to
 /// happen while the volume is mounted or Finder files it as a folder. A
 /// failure is logged, never fatal: the drive works without the row.
-fn pin_to_sidebar(id: &str, mountpoint: &str) {
+fn pin_to_sidebar(id: &str, label: &str, mountpoint: &str) {
     if !cfg!(target_os = "macos") || mountpoint.is_empty() {
         return;
     }
     let id = id.to_string();
+    let label = label.to_string();
     let path = std::path::PathBuf::from(mountpoint);
-    tokio::task::spawn_blocking(move || match crate::finder::pin_volume(&path) {
+    tokio::task::spawn_blocking(move || match crate::finder::pin_volume(&path, &label) {
         Ok(true) => tracing::info!(remote = %id, path = %path.display(), "pinned to Finder's sidebar"),
         Ok(false) => {}
         Err(e) => tracing::warn!(remote = %id, "could not pin to Finder's sidebar: {e}"),
