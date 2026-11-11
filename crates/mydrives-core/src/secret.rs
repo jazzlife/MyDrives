@@ -132,76 +132,219 @@ fn keychain_set(remote_id: &str, secret: &str) -> Result<()> {
 /// somewhere that cannot show a dialog, the read simply blocks forever. We saw
 /// both: the prompt on a rebuild, and a hung mount when no dialog could appear.
 ///
-/// `security add-generic-password -A` writes the item with an empty ACL, which
+/// So the item is written with an ACL that names no application at all, which
 /// means "any application running as this user may read it without prompting".
 /// The trade-off is deliberate and worth stating: a different program running as
 /// the same user could read the password without the user being asked. That is
 /// already true of the config file, the mount itself and the user's own files,
 /// and it is the behaviour every always-on drive agent needs.
-/// The password is handed over on **stdin**, not as `-w <secret>`: an argument
-/// is visible in `ps` for as long as the child lives. `security` asks for it
-/// twice (prompt + retype) and reads both from stdin when it is not a terminal,
-/// which is why the value is written twice. A password containing a newline
-/// cannot be expressed that way, so those take the library path instead.
 #[cfg(target_os = "macos")]
 fn keychain_set(remote_id: &str, secret: &str) -> Result<()> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let output = if secret.contains(['\n', '\r']) {
-        None
-    } else {
-        // Replace rather than update (`-U`): updating keeps whatever access
-        // list the existing item already had - including the per-application
-        // one an older build left behind, which is the thing being fixed here -
-        // and modifying a protected item needs authorisation of its own.
-        let _ = keychain_delete(remote_id);
-        let mut child = Command::new("/usr/bin/security")
-            .arg("add-generic-password")
-            .arg("-A") // no per-application ACL: no prompt on the next build
-            .args(["-s", SERVICE])
-            .args(["-a", remote_id])
-            .args(["-D", "MyDrives password"])
-            .arg("-w") // value omitted on purpose: read from stdin below
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::Backend(format!("running /usr/bin/security: {e}")))?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            let _ = write!(stdin, "{secret}\n{secret}\n");
+    // Replace rather than update: updating keeps whatever access list the
+    // existing item already had, including the per-application one an older
+    // build left behind, which is the thing being fixed here.
+    let _ = keychain_delete(remote_id);
+    match keychain_set_without_acl(remote_id, secret) {
+        // Reading it back proves the point of the exercise: the item opens
+        // with no prompt, and nothing was truncated on the way in.
+        Ok(()) if matches!(keychain_get(remote_id), Ok(Some(ref s)) if s == secret) => {
+            return Ok(())
         }
-        drop(child.stdin.take());
-        Some(
-            child
-                .wait_with_output()
-                .map_err(|e| Error::Backend(format!("waiting for /usr/bin/security: {e}")))?,
-        )
-    };
-
-    if let Some(output) = &output {
-        // `security` exits 0 even when its two stdin reads disagreed - it then
-        // stores an *empty* password - so the only trustworthy check is reading
-        // the item back. Doing that through the Security framework also proves
-        // the point of the exercise: the item opens with no prompt.
-        if output.status.success() && matches!(keychain_get(remote_id), Ok(Some(ref s)) if s == secret)
-        {
-            return Ok(());
-        }
+        Ok(()) => tracing::warn!(
+            remote = remote_id,
+            "the keychain item did not read back as written; falling back"
+        ),
+        Err(status) => tracing::warn!(
+            remote = remote_id,
+            status,
+            "could not store the password without an ACL; falling back"
+        ),
     }
-    let stderr = output
-        .as_ref()
-        .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
-        .unwrap_or_else(|| "the password contains a line break".to_string());
-    // Fall back to the library path; it still works, it just prompts later.
-    tracing::warn!(
-        remote = remote_id,
-        detail = %stderr,
-        "could not store the password without an ACL; falling back"
-    );
+    let _ = keychain_delete(remote_id);
+    // The library path still works, it just asks the user again after every
+    // update of the app.
     entry(remote_id)?
         .set_password(secret)
         .map_err(|e| Error::Backend(format!("keychain write {remote_id}: {e}")))
+}
+
+/// Writes the item straight through the Security framework with an ACL that
+/// names no application, which is what "any program running as this user may
+/// read this without a prompt" looks like on macOS.
+///
+/// This used to shell out to `/usr/bin/security -A` with the value on stdin.
+/// That tool reads a password from stdin through its interactive prompt, and
+/// the prompt stops at **128 characters** (measured on 2026-11-11). Short NAS
+/// and FTP passwords went through; an OAuth token set is a JSON document of
+/// several hundred bytes, so it was silently truncated, the read-back check
+/// failed, and every cloud drive fell back to a write that *does* attach a
+/// per-application ACL. That ACL names the binary by its code signature, so
+/// each new build asked the user for permission all over again.
+#[cfg(target_os = "macos")]
+fn keychain_set_without_acl(remote_id: &str, secret: &str) -> std::result::Result<(), i32> {
+    use std::ffi::c_void;
+
+    type CFTypeRef = *const c_void;
+    type OSStatus = i32;
+
+    #[repr(C)]
+    struct Attribute {
+        tag: u32,
+        length: u32,
+        data: *mut c_void,
+    }
+    #[repr(C)]
+    struct AttributeList {
+        count: u32,
+        attr: *mut Attribute,
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: CFTypeRef);
+        fn CFStringCreateWithBytes(
+            alloc: CFTypeRef,
+            bytes: *const u8,
+            num_bytes: isize,
+            encoding: u32,
+            is_external: u8,
+        ) -> CFTypeRef;
+        fn CFArrayGetCount(array: CFTypeRef) -> isize;
+        fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
+    }
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SecKeychainCopyDefault(keychain: *mut CFTypeRef) -> OSStatus;
+        fn SecAccessCreate(
+            descriptor: CFTypeRef,
+            trusted_list: CFTypeRef,
+            access: *mut CFTypeRef,
+        ) -> OSStatus;
+        fn SecAccessCopyACLList(access: CFTypeRef, acl_list: *mut CFTypeRef) -> OSStatus;
+        fn SecACLSetContents(
+            acl: CFTypeRef,
+            application_list: CFTypeRef,
+            description: CFTypeRef,
+            prompt_selector: u16,
+        ) -> OSStatus;
+        fn SecKeychainItemCreateFromContent(
+            item_class: u32,
+            attr_list: *const AttributeList,
+            length: u32,
+            data: *const c_void,
+            keychain: CFTypeRef,
+            initial_access: CFTypeRef,
+            item: *mut CFTypeRef,
+        ) -> OSStatus;
+    }
+
+    /// Frees a CoreFoundation object when it goes out of scope.
+    struct Owned(CFTypeRef);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0) }
+            }
+        }
+    }
+
+    const UTF8: u32 = 0x0800_0100;
+    const GENERIC_PASSWORD: u32 = u32::from_be_bytes(*b"genp");
+    const SERVICE_ATTR: u32 = u32::from_be_bytes(*b"svce");
+    const ACCOUNT_ATTR: u32 = u32::from_be_bytes(*b"acct");
+    const DESCRIPTION_ATTR: u32 = u32::from_be_bytes(*b"desc");
+
+    let cfstring = |s: &str| -> Owned {
+        Owned(unsafe {
+            CFStringCreateWithBytes(
+                std::ptr::null(),
+                s.as_ptr(),
+                s.len() as isize,
+                UTF8,
+                0,
+            )
+        })
+    };
+
+    unsafe {
+        let mut keychain: CFTypeRef = std::ptr::null();
+        let status = SecKeychainCopyDefault(&mut keychain);
+        if status != 0 {
+            return Err(status);
+        }
+        let keychain = Owned(keychain);
+
+        // An access object whose ACLs trust nobody in particular. Created
+        // with a NULL trusted list it starts out naming this process, so
+        // every ACL is rewritten below.
+        let label = cfstring(SERVICE);
+        let mut access: CFTypeRef = std::ptr::null();
+        let status = SecAccessCreate(label.0, std::ptr::null(), &mut access);
+        if status != 0 {
+            return Err(status);
+        }
+        let access = Owned(access);
+
+        let mut acls: CFTypeRef = std::ptr::null();
+        let status = SecAccessCopyACLList(access.0, &mut acls);
+        if status != 0 {
+            return Err(status);
+        }
+        let acls = Owned(acls);
+        let empty = cfstring("");
+        for i in 0..CFArrayGetCount(acls.0) {
+            let acl = CFArrayGetValueAtIndex(acls.0, i);
+            // A NULL application list is the documented way to say "any
+            // application", and a zero prompt selector means "never ask".
+            let status = SecACLSetContents(acl, std::ptr::null(), empty.0, 0);
+            if status != 0 {
+                return Err(status);
+            }
+        }
+
+        let mut service = SERVICE.as_bytes().to_vec();
+        let mut account = remote_id.as_bytes().to_vec();
+        let mut description = b"MyDrives password".to_vec();
+        let mut attrs = [
+            Attribute {
+                tag: SERVICE_ATTR,
+                length: service.len() as u32,
+                data: service.as_mut_ptr() as *mut c_void,
+            },
+            Attribute {
+                tag: ACCOUNT_ATTR,
+                length: account.len() as u32,
+                data: account.as_mut_ptr() as *mut c_void,
+            },
+            Attribute {
+                tag: DESCRIPTION_ATTR,
+                length: description.len() as u32,
+                data: description.as_mut_ptr() as *mut c_void,
+            },
+        ];
+        let list = AttributeList {
+            count: attrs.len() as u32,
+            attr: attrs.as_mut_ptr(),
+        };
+        let mut item: CFTypeRef = std::ptr::null();
+        let status = SecKeychainItemCreateFromContent(
+            GENERIC_PASSWORD,
+            &list,
+            secret.len() as u32,
+            secret.as_ptr() as *const c_void,
+            keychain.0,
+            access.0,
+            &mut item,
+        );
+        if !item.is_null() {
+            CFRelease(item);
+        }
+        if status != 0 {
+            return Err(status);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -327,6 +470,27 @@ mod tests {
         store(id, pw).expect("storing the password");
         assert_eq!(keychain_get(id).unwrap().as_deref(), Some(pw));
         delete(id).expect("deleting the password");
+        assert!(keychain_get(id).unwrap().is_none());
+    }
+
+    /// A sign-in leaves behind a JSON token set of several hundred bytes, not
+    /// a password someone typed. The writer this replaced handed the value to
+    /// `/usr/bin/security` on stdin, which stops reading at 128 characters: it
+    /// stored a truncated string, the drive fell back to a write that pins the
+    /// item to one binary, and every rebuild asked the user for permission.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_token_set_is_stored_whole_however_long_it_is() {
+        let id = "mydrives-selftest-long";
+        let pw = format!(
+            r#"{{"access_token":"{}","refresh_token":"{}","expires_at":1794000000}}"#,
+            "y29.".to_string() + &"A1b2C3d4".repeat(240),
+            "1//0e".to_string() + &"Z9y8X7w6".repeat(12),
+        );
+        assert!(pw.len() > 1900, "the sample is longer than any prompt buffer");
+        store(id, &pw).expect("storing the token set");
+        assert_eq!(keychain_get(id).unwrap().as_deref(), Some(pw.as_str()));
+        delete(id).expect("deleting the token set");
         assert!(keychain_get(id).unwrap().is_none());
     }
 }
