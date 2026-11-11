@@ -48,7 +48,10 @@ impl RPath {
     }
 
     pub fn join(&self, name: &str) -> Self {
-        if name.contains('/') || name.contains('\\') {
+        // "." and ".." come in as ordinary names from FUSE lookups, and a key
+        // like "/Projects/.." would miss every cache and send the server a
+        // path it answers slowly. Normalising them keeps the key canonical.
+        if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
             return RPath::new(&format!("{}/{}", self.0, name));
         }
         if self.is_root() {

@@ -317,7 +317,11 @@ impl SmbBackend {
         );
         let resource = self.open_resource(path, &args).await?;
         let is_dir = resource.is_dir();
-        let basic: smb::FileBasicInformation = match &resource {
+        // One query, not two: FileNetworkOpenInformation carries the times,
+        // the attributes *and* the size, so a stat is create + query + close
+        // rather than create + basic + standard + close. Over a WAN every
+        // round trip is a noticeable share of a Finder refresh.
+        let info: smb::FileNetworkOpenInformation = match &resource {
             Resource::File(f) => f.query_info().await,
             Resource::Directory(d) => d.query_info().await,
             Resource::Pipe(_) => {
@@ -325,22 +329,17 @@ impl SmbBackend {
             }
         }
         .map_err(|e| map_smb_err(e, path.as_str()))?;
-
-        let size = match &resource {
-            Resource::File(f) => f.get_len().await.map_err(|e| map_smb_err(e, path.as_str()))?,
-            _ => 0,
-        };
         close_resource(resource, path).await?;
 
         Ok(Attr {
             kind: if is_dir { FileKind::Dir } else { FileKind::File },
-            size,
-            crtime: filetime_to_system_time(*basic.creation_time),
-            atime: filetime_to_system_time(*basic.last_access_time),
-            mtime: filetime_to_system_time(*basic.last_write_time),
-            ctime: filetime_to_system_time(*basic.change_time),
-            readonly: basic.file_attributes.readonly(),
-            hidden: basic.file_attributes.hidden(),
+            size: if is_dir { 0 } else { info.end_of_file },
+            crtime: filetime_to_system_time(*info.creation_time),
+            atime: filetime_to_system_time(*info.last_access_time),
+            mtime: filetime_to_system_time(*info.last_write_time),
+            ctime: filetime_to_system_time(*info.change_time),
+            readonly: info.file_attributes.readonly(),
+            hidden: info.file_attributes.hidden(),
         })
     }
 

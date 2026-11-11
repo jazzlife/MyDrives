@@ -609,6 +609,20 @@ impl Locks {
 
 impl FuseFs {
     fn attr(&self, ino: Ino, attr: &Attr) -> FileAttr {
+        file_attr(self.uid, self.gid, self.readonly, ino, attr)
+    }
+
+    /// The pieces a request needs once it has left this struct behind: the
+    /// VFS and what goes into every `FileAttr`.
+    fn detach(&self) -> (Arc<Vfs>, u32, u32, bool) {
+        (self.vfs.clone(), self.uid, self.gid, self.readonly)
+    }
+}
+
+/// Builds the attributes the kernel sees. A free function so a request handled
+/// on the runtime, after the callback has returned, can build them too.
+fn file_attr(uid: u32, gid: u32, readonly: bool, ino: Ino, attr: &Attr) -> FileAttr {
+    {
         FileAttr {
             ino: INodeNo(ino),
             size: attr.size,
@@ -621,14 +635,14 @@ impl FuseFs {
                 FileKind::Dir => FileType::Directory,
                 FileKind::File => FileType::RegularFile,
             },
-            perm: if self.readonly {
+            perm: if readonly {
                 attr.unix_mode() & 0o555
             } else {
                 attr.unix_mode()
             },
             nlink: if attr.is_dir() { 2 } else { 1 },
-            uid: self.uid,
-            gid: self.gid,
+            uid,
+            gid,
             rdev: 0,
             blksize: 4096,
             flags: 0,
@@ -720,12 +734,25 @@ fn time_or_now(t: TimeOrNow) -> SystemTime {
 }
 
 impl fuser::Filesystem for FuseFs {
+    // Lookups, attribute reads, listings and reads are answered from a task on
+    // the runtime rather than inline. FUSE-T hands us requests on a single
+    // thread (its channel is a socket that cannot be cloned), so answering
+    // inline meant one network round trip at a time: a folder of forty
+    // entries that Finder stats one by one took forty round trips in a row.
+    // Spawned, the requests overlap and the kernel still sees each reply as
+    // soon as it is ready. Writes and everything that changes state stay
+    // inline, in the order the kernel sent them.
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name_of(name);
-        match self.rt.block_on(self.vfs.lookup(parent.0, &name)) {
-            Ok((ino, attr)) => reply.entry(&TTL, &self.attr(ino, &attr), Generation(0)),
-            Err(e) => reply.error(errno(&e)),
-        }
+        let (vfs, uid, gid, ro) = self.detach();
+        self.rt.spawn(async move {
+            match vfs.lookup(parent.0, &name).await {
+                Ok((ino, attr)) => {
+                    reply.entry(&TTL, &file_attr(uid, gid, ro, ino, &attr), Generation(0))
+                }
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
@@ -733,10 +760,13 @@ impl fuser::Filesystem for FuseFs {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.rt.block_on(self.vfs.getattr(ino.0)) {
-            Ok(attr) => reply.attr(&TTL, &self.attr(ino.0, &attr)),
-            Err(e) => reply.error(errno(&e)),
-        }
+        let (vfs, uid, gid, ro) = self.detach();
+        self.rt.spawn(async move {
+            match vfs.getattr(ino.0).await {
+                Ok(attr) => reply.attr(&TTL, &file_attr(uid, gid, ro, ino.0, &attr)),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -872,10 +902,13 @@ impl fuser::Filesystem for FuseFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.rt.block_on(self.vfs.read(fh.0, offset, size)) {
-            Ok(data) => reply.data(&data),
-            Err(e) => reply.error(errno(&e)),
-        }
+        let vfs = self.vfs.clone();
+        self.rt.spawn(async move {
+            match vfs.read(fh.0, offset, size).await {
+                Ok(data) => reply.data(&data),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1022,37 +1055,40 @@ impl fuser::Filesystem for FuseFs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let entries = match self.rt.block_on(self.vfs.readdir(ino.0)) {
-            Ok(e) => e,
-            Err(e) => return reply.error(errno(&e)),
-        };
-        // "." and ".." are ours to synthesize; the VFS never reports them.
-        let parent_ino = match self.vfs.path_of(ino.0).ok().and_then(|p| p.parent()) {
-            Some(parent) => self.vfs.intern(&parent, FileKind::Dir),
-            None => ino.0,
-        };
-        let mut all: Vec<(Ino, FileType, String)> = vec![
-            (ino.0, FileType::Directory, ".".to_string()),
-            (parent_ino, FileType::Directory, "..".to_string()),
-        ];
-        for (child_ino, entry) in entries {
-            all.push((
-                child_ino,
-                match entry.attr.kind {
-                    FileKind::Dir => FileType::Directory,
-                    FileKind::File => FileType::RegularFile,
-                },
-                entry.name,
-            ));
-        }
-        for (i, (child, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
-            // The offset the kernel sends back is "where to resume", so it is the
-            // index *after* this entry.
-            if reply.add(INodeNo(child), i as u64 + 1, kind, &name) {
-                break;
+        let vfs = self.vfs.clone();
+        self.rt.spawn(async move {
+            let entries = match vfs.readdir(ino.0).await {
+                Ok(e) => e,
+                Err(e) => return reply.error(errno(&e)),
+            };
+            // "." and ".." are ours to synthesize; the VFS never reports them.
+            let parent_ino = match vfs.path_of(ino.0).ok().and_then(|p| p.parent()) {
+                Some(parent) => vfs.intern(&parent, FileKind::Dir),
+                None => ino.0,
+            };
+            let mut all: Vec<(Ino, FileType, String)> = vec![
+                (ino.0, FileType::Directory, ".".to_string()),
+                (parent_ino, FileType::Directory, "..".to_string()),
+            ];
+            for (child_ino, entry) in entries {
+                all.push((
+                    child_ino,
+                    match entry.attr.kind {
+                        FileKind::Dir => FileType::Directory,
+                        FileKind::File => FileType::RegularFile,
+                    },
+                    entry.name,
+                ));
             }
-        }
-        reply.ok();
+            for (i, (child, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
+                // The offset the kernel sends back is "where to resume", so it
+                // is the index *after* this entry.
+                if reply.add(INodeNo(child), i as u64 + 1, kind, &name) {
+                    break;
+                }
+            }
+            reply.ok();
+        });
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {

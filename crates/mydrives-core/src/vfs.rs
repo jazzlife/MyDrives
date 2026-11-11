@@ -43,8 +43,13 @@ pub struct VfsOptions {
 impl Default for VfsOptions {
     fn default() -> Self {
         VfsOptions {
-            attr_ttl: Duration::from_secs(2),
-            dir_ttl: Duration::from_secs(2),
+            // Ten seconds, not two: Finder re-stats every entry of a folder on
+            // each refresh, and over a WAN link each miss is ~120 ms. A change
+            // made from another machine shows within this delay, which is the
+            // same order macOS's own SMB client caches for. Our own writes
+            // invalidate immediately.
+            attr_ttl: Duration::from_secs(10),
+            dir_ttl: Duration::from_secs(10),
             read_chunk: 1 << 20,
             readonly: false,
         }
@@ -302,7 +307,33 @@ impl Vfs {
             self.meta.put_attr(path, attr);
             return Ok(attr);
         }
-        let attr = self.count_call(self.backend.stat(path).await)?;
+        if self.meta.is_absent(path) {
+            self.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::NotFound(path.to_string()));
+        }
+        // A fresh listing of the parent is the authority on which names exist:
+        // one it does not show is absent, and the server need not be asked.
+        // This is most lookups a folder gets - macOS probes a `._name` sidecar
+        // for every entry it just listed, each a round trip set of its own.
+        // Names compare without case, as the server would.
+        if let Some(parent) = path.parent() {
+            if let Some(listing) = self.meta.dir(&parent) {
+                let wanted = path.name().to_lowercase();
+                if !listing.iter().any(|e| e.name.to_lowercase() == wanted) {
+                    self.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    self.meta.put_absent(path);
+                    return Err(Error::NotFound(path.to_string()));
+                }
+            }
+        }
+        let attr = match self.count_call(self.backend.stat(path).await) {
+            Ok(attr) => attr,
+            Err(e @ Error::NotFound(_)) => {
+                self.meta.put_absent(path);
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         self.meta.put_attr(path, attr);
         Ok(self.with_floor(path, attr))
     }

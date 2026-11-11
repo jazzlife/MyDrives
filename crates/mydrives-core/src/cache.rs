@@ -18,6 +18,10 @@ use crate::types::{Attr, DirEntry};
 pub struct MetaCache {
     attrs: Mutex<HashMap<String, (Attr, Instant)>>,
     dirs: Mutex<HashMap<String, (Arc<Vec<DirEntry>>, Instant)>>,
+    /// Names the server said do not exist. Finder probes several of these in
+    /// every folder it opens (`.DS_Store`, `._*`, `.localized`, `Icon\r`), and
+    /// each probe answered by the server costs a full round trip set.
+    absent: Mutex<HashMap<String, Instant>>,
     attr_ttl: Duration,
     dir_ttl: Duration,
 }
@@ -27,9 +31,24 @@ impl MetaCache {
         MetaCache {
             attrs: Mutex::new(HashMap::new()),
             dirs: Mutex::new(HashMap::new()),
+            absent: Mutex::new(HashMap::new()),
             attr_ttl,
             dir_ttl,
         }
+    }
+
+    /// Was `path` recently reported missing? Shares the attribute TTL: a file
+    /// that appears from elsewhere shows up within the same delay as a changed
+    /// size would.
+    pub fn is_absent(&self, path: &RPath) -> bool {
+        let map = self.absent.lock();
+        matches!(map.get(path.as_str()), Some(at) if at.elapsed() <= self.attr_ttl)
+    }
+
+    pub fn put_absent(&self, path: &RPath) {
+        self.absent
+            .lock()
+            .insert(path.as_str().to_string(), Instant::now());
     }
 
     pub fn attr(&self, path: &RPath) -> Option<Attr> {
@@ -65,8 +84,13 @@ impl MetaCache {
         {
             let now = Instant::now();
             let mut attrs = self.attrs.lock();
+            let mut absent = self.absent.lock();
             for e in entries.iter() {
-                attrs.insert(path.join(&e.name).into_string(), (e.attr, now));
+                let child = path.join(&e.name).into_string();
+                // A name the listing shows is not absent, whatever was said
+                // before.
+                absent.remove(&child);
+                attrs.insert(child, (e.attr, now));
             }
         }
         self.dirs
@@ -78,6 +102,7 @@ impl MetaCache {
     /// may have appeared, grown or vanished).
     pub fn invalidate(&self, path: &RPath) {
         self.attrs.lock().remove(path.as_str());
+        self.absent.lock().remove(path.as_str());
         self.dirs.lock().remove(path.as_str());
         if let Some(parent) = path.parent() {
             self.dirs.lock().remove(parent.as_str());
@@ -90,6 +115,9 @@ impl MetaCache {
         self.attrs
             .lock()
             .retain(|k, _| !path.is_ancestor_of(&RPath::new(k)));
+        self.absent
+            .lock()
+            .retain(|k, _| !path.is_ancestor_of(&RPath::new(k)));
         self.dirs
             .lock()
             .retain(|k, _| !path.is_ancestor_of(&RPath::new(k)));
@@ -97,6 +125,7 @@ impl MetaCache {
 
     pub fn clear(&self) {
         self.attrs.lock().clear();
+        self.absent.lock().clear();
         self.dirs.lock().clear();
     }
 
