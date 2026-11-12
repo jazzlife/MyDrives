@@ -22,6 +22,7 @@ tracing.workspace = true
 directories = "6"
 # PKCE verifiers and the sign-in `state` need real randomness.
 getrandom = "0.3"
+unicode-normalization = "0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
@@ -33,3 +34,6 @@ plist = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# The keychain-probe example only matters for the warnings `secret::store`
+# emits, so it needs somewhere to print them.
+tracing-subscriber.workspace = true

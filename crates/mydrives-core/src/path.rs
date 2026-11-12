@@ -7,6 +7,25 @@
 
 use std::fmt;
 
+/// Puts a name in composed form (NFC).
+///
+/// macOS hands filenames to a filesystem in decomposed form: Finder asks for
+/// `\u{1100}\u{1161}...`, five code points, where every one of these
+/// services stores and returns the single composed syllable. Comparing the
+/// bytes made the two different names, so a Korean path listed fine and then
+/// would not open - `open` said "does not exist" while `ls` on the same path
+/// worked, because a shell passes through whatever the user typed.
+///
+/// Composing on the way in means everything below this type - caches, id
+/// lookups, the services themselves - sees one spelling.
+fn compose(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    if name.is_ascii() {
+        return name.to_string();
+    }
+    name.nfc().collect()
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RPath(String);
 
@@ -18,14 +37,14 @@ impl RPath {
     /// Normalizes any user- or OS-supplied path. Accepts both separators because
     /// Windows mount layers hand us backslashes.
     pub fn new(s: &str) -> Self {
-        let mut out: Vec<&str> = Vec::new();
+        let mut out: Vec<String> = Vec::new();
         for part in s.split(['/', '\\']) {
             match part {
                 "" | "." => {}
                 ".." => {
                     out.pop();
                 }
-                p => out.push(p),
+                p => out.push(compose(p)),
             }
         }
         if out.is_empty() {
@@ -54,6 +73,7 @@ impl RPath {
         if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
             return RPath::new(&format!("{}/{}", self.0, name));
         }
+        let name = compose(name);
         if self.is_root() {
             RPath(format!("/{name}"))
         } else {
@@ -186,5 +206,34 @@ mod tests {
         assert_eq!(file.reparent(&dir, &to).unwrap().as_str(), "/z/c.txt");
         assert_eq!(dir.reparent(&dir, &to).unwrap().as_str(), "/z");
         assert!(RPath::new("/other").reparent(&dir, &to).is_none());
+    }
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::*;
+
+    /// macOS asks for a decomposed name; the services answer with a composed
+    /// one. They have to be the same path or the file lists but will not open.
+    #[test]
+    fn a_decomposed_korean_name_is_the_same_path_as_the_composed_one() {
+        let composed = "개인";
+        let decomposed = "\u{1100}\u{1162}\u{110B}\u{1175}\u{11AB}";
+        assert_ne!(composed, decomposed, "the two spellings differ byte for byte");
+        assert_eq!(RPath::new(decomposed), RPath::new(composed));
+        assert_eq!(
+            RPath::root().join(decomposed),
+            RPath::root().join(composed)
+        );
+        assert_eq!(
+            RPath::new("/Docs").join(decomposed).as_str(),
+            "/Docs/개인"
+        );
+    }
+
+    #[test]
+    fn an_ascii_name_is_left_exactly_as_it_was() {
+        assert_eq!(RPath::new("/a/b.txt").as_str(), "/a/b.txt");
+        assert_eq!(RPath::root().join("Bass-Clef.pdf").as_str(), "/Bass-Clef.pdf");
     }
 }
