@@ -23,6 +23,7 @@
 pub mod autostart;
 pub mod backend;
 pub mod backends;
+pub mod timed;
 pub mod cache;
 pub mod config;
 pub mod console;
@@ -45,6 +46,7 @@ pub use error::{Error, Result};
 pub use manager::{BackendFactory, MountManager, MountState, RemoteStatus};
 pub use mount::{MountProvider, MountSession, MountSpec, MountTarget};
 pub use path::RPath;
+pub use timed::Timed;
 pub use types::{
     Attr, Caps, DirEntry, Fh, FileKind, FsStat, Ino, OpenOpts, SetAttr, ROOT_INO,
 };

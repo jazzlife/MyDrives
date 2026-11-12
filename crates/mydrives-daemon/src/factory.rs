@@ -47,6 +47,15 @@ pub struct Factory;
 
 impl BackendFactory for Factory {
     fn build(&self, cfg: &RemoteConfig) -> Result<Arc<dyn Backend>> {
+        // Every backend goes out through the timer. It forwards each call
+        // untouched and only records how long it took, so a drive that feels
+        // slow can be told apart from a service that is slow.
+        Ok(Arc::new(mydrives_core::Timed::new(self.build_inner(cfg)?)))
+    }
+}
+
+impl Factory {
+    fn build_inner(&self, cfg: &RemoteConfig) -> Result<Arc<dyn Backend>> {
         match &cfg.backend {
             BackendConfig::Smb(smb) => {
                 let password = load_secret(&cfg.id, &smb.secret)?.unwrap_or_default();
