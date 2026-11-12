@@ -390,9 +390,16 @@ impl NfsBridge {
         &self,
         dirid: fileid3,
     ) -> std::result::Result<(Vec<(Ino, mydrives_core::types::DirEntry)>, bool), nfsstat3> {
-        // Already walking this one: do not start the same walk twice.
+        // Already walking this one: do not start the same walk twice, but do
+        // hand over what has landed. These retries are exactly the calls that
+        // should be collecting the pages as they arrive - refusing them is
+        // what made a folder of 23,362 entries sit through the whole 35 s
+        // walk even though its first page was there after 1.8 s.
         if !self.listing.lock().insert(dirid) {
-            return Err(nfsstat3::NFS3ERR_JUKEBOX);
+            return match self.vfs.partial_readdir(dirid) {
+                Some(sofar) if !sofar.is_empty() => Ok((sofar, false)),
+                _ => Err(nfsstat3::NFS3ERR_JUKEBOX),
+            };
         }
         let vfs = self.vfs.clone();
         let inflight = self.listing.clone();

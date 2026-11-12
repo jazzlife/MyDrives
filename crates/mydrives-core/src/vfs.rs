@@ -358,17 +358,44 @@ impl Vfs {
         }
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<DirEntry>>(4);
         let walk = self.backend.readdir_pages(path, tx);
+        let started = std::time::Instant::now();
         let gather = async {
             let mut all: Vec<DirEntry> = Vec::new();
+            let mut pages = 0u32;
+            let mut first_page: Option<std::time::Duration> = None;
             while let Some(page) = rx.recv().await {
+                pages += 1;
+                first_page.get_or_insert_with(|| started.elapsed());
+                tracing::debug!(
+                    path = path.as_str(),
+                    page = pages,
+                    entries = page.len(),
+                    total = all.len() + page.len(),
+                    ms = started.elapsed().as_millis() as u64,
+                    "listing page"
+                );
                 all.extend(page);
                 self.partials
                     .lock()
                     .insert(path.as_str().to_string(), Arc::new(all.clone()));
             }
-            all
+            (all, pages, first_page)
         };
-        let (walked, all) = tokio::join!(walk, gather);
+        let (walked, (all, pages, first_page)) = tokio::join!(walk, gather);
+        // A folder that answered at once needs no comment. One that took its
+        // time is worth a line saying how it was spent - above all how soon
+        // the first page landed, because that is what decides whether the
+        // layers above can show anything early.
+        if started.elapsed() >= std::time::Duration::from_secs(1) {
+            tracing::info!(
+                path = path.as_str(),
+                pages,
+                entries = all.len(),
+                first_page_ms = first_page.map(|d| d.as_millis() as u64),
+                total_ms = started.elapsed().as_millis() as u64,
+                "slow listing"
+            );
+        }
         self.partials.lock().remove(path.as_str());
         self.count_call(walked)?;
         let entries = Arc::new(all);
