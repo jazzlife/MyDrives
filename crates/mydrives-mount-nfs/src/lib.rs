@@ -48,6 +48,7 @@ use mydrives_core::vfs::Vfs;
 /// How many backend handles the bridge keeps open. NFS is stateless, so handles
 /// are opened on demand and recycled; without a cap a `find /mnt` would open
 /// every file on the share.
+const LISTING_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_OPEN_HANDLES: usize = 64;
 /// Kept short on purpose. An open SMB handle blocks deleting or renaming the
 /// file on most servers (sharing violation), so a cached handle that outlives
@@ -361,9 +362,53 @@ struct NfsBridge {
     gid: u32,
     handles: Mutex<HashMap<Ino, OpenHandle>>,
     last_expire: Mutex<Instant>,
+    /// Directories whose listing is running right now, so a retry joins the
+    /// walk already under way instead of starting a second one.
+    listing: Arc<Mutex<std::collections::HashSet<fileid3>>>,
+    /// How long to wait for a walk before telling the client to ask again.
+    listing_deadline: Duration,
 }
 
 impl NfsBridge {
+    /// The directory's entries, without sitting on this connection while a
+    /// slow backend walks it.
+    ///
+    /// A folder of a few hundred files on a paging API is not one call: Google
+    /// Drive hands back a page at a time, and one `readdir` of a large folder
+    /// was measured here at 31.8 seconds. For all of that the NFS server was
+    /// inside a single request and answering nothing else, which is long
+    /// enough for the kernel to decide the server has gone and put up "server
+    /// connection interrupted".
+    ///
+    /// So the walk is spawned rather than awaited in place. If it finishes
+    /// quickly the answer goes straight back, which is every ordinary folder.
+    /// If it does not, the client is told to ask again - NFS3ERR_JUKEBOX, the
+    /// protocol's own "busy, retry" - while the walk keeps going and fills the
+    /// VFS cache, so the retry is served from there. Nothing is cancelled and
+    /// no partial listing is ever returned.
+    async fn listing(&self, dirid: fileid3) -> std::result::Result<Vec<(Ino, mydrives_core::types::DirEntry)>, nfsstat3> {
+        // Already walking this one: do not start the same walk twice.
+        if !self.listing.lock().insert(dirid) {
+            return Err(nfsstat3::NFS3ERR_JUKEBOX);
+        }
+        let vfs = self.vfs.clone();
+        let inflight = self.listing.clone();
+        // Spawned, not awaited in place: a `timeout` around the future itself
+        // would cancel the walk, and the retry would start over and never get
+        // anywhere.
+        let walk = tokio::spawn(async move {
+            let r = vfs.readdir(dirid).await;
+            inflight.lock().remove(&dirid);
+            r
+        });
+        match tokio::time::timeout(self.listing_deadline, walk).await {
+            Ok(Ok(entries)) => entries.map_err(status),
+            // The task itself fell over; the set entry went with it.
+            Ok(Err(_)) => Err(nfsstat3::NFS3ERR_IO),
+            Err(_) => Err(nfsstat3::NFS3ERR_JUKEBOX),
+        }
+    }
+
     fn new(vfs: Arc<Vfs>, id: &str) -> Self {
         let mut fsid: u64 = 1469598103934665603;
         for b in id.as_bytes() {
@@ -377,6 +422,8 @@ impl NfsBridge {
             gid: unsafe { libc::getgid() },
             handles: Mutex::new(HashMap::new()),
             last_expire: Mutex::new(Instant::now()),
+            listing: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            listing_deadline: LISTING_DEADLINE,
         }
     }
 
@@ -796,7 +843,7 @@ impl NFSFileSystem for NfsBridge {
         start_after: fileid3,
         max_entries: usize,
     ) -> std::result::Result<ReadDirResult, nfsstat3> {
-        let mut entries = self.vfs.readdir(dirid).await.map_err(status)?;
+        let mut entries = self.listing(dirid).await?;
         // NFS requires a deterministic order across paginated calls.
         entries.sort_by(|a, b| a.1.name.cmp(&b.1.name));
 
@@ -852,6 +899,155 @@ mod tests {
     fn bridge() -> NfsBridge {
         let vfs = Vfs::new(Arc::new(fixture("t")), VfsOptions::default());
         NfsBridge::new(vfs, "t")
+    }
+
+    /// A backend that takes its time over a listing, as a paging cloud API
+    /// does on a folder of a few hundred files.
+    struct SlowList {
+        inner: mydrives_core::backends::mem::MemBackend,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl mydrives_core::Backend for SlowList {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+        fn caps(&self) -> mydrives_core::types::Caps {
+            self.inner.caps()
+        }
+        async fn connect(&self) -> Result<()> {
+            self.inner.connect().await
+        }
+        async fn disconnect(&self) -> Result<()> {
+            self.inner.disconnect().await
+        }
+        async fn stat(&self, p: &mydrives_core::RPath) -> Result<Attr> {
+            self.inner.stat(p).await
+        }
+        async fn readdir(
+            &self,
+            p: &mydrives_core::RPath,
+        ) -> Result<Vec<mydrives_core::types::DirEntry>> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.readdir(p).await
+        }
+        async fn open(
+            &self,
+            p: &mydrives_core::RPath,
+            o: OpenOpts,
+        ) -> Result<mydrives_core::BFile> {
+            self.inner.open(p, o).await
+        }
+        async fn create(&self, p: &mydrives_core::RPath) -> Result<mydrives_core::BFile> {
+            self.inner.create(p).await
+        }
+        async fn read_at(
+            &self,
+            f: mydrives_core::BFile,
+            o: u64,
+            l: u32,
+        ) -> Result<Vec<u8>> {
+            self.inner.read_at(f, o, l).await
+        }
+        async fn write_at(
+            &self,
+            f: mydrives_core::BFile,
+            o: u64,
+            d: &[u8],
+        ) -> Result<u32> {
+            self.inner.write_at(f, o, d).await
+        }
+        async fn flush(&self, f: mydrives_core::BFile) -> Result<()> {
+            self.inner.flush(f).await
+        }
+        async fn close(&self, f: mydrives_core::BFile) -> Result<()> {
+            self.inner.close(f).await
+        }
+        async fn set_len(
+            &self,
+            p: &mydrives_core::RPath,
+            f: Option<mydrives_core::BFile>,
+            l: u64,
+        ) -> Result<()> {
+            self.inner.set_len(p, f, l).await
+        }
+        async fn set_attr(
+            &self,
+            p: &mydrives_core::RPath,
+            f: Option<mydrives_core::BFile>,
+            a: &SetAttr,
+        ) -> Result<()> {
+            self.inner.set_attr(p, f, a).await
+        }
+        async fn mkdir(&self, p: &mydrives_core::RPath) -> Result<()> {
+            self.inner.mkdir(p).await
+        }
+        async fn unlink(&self, p: &mydrives_core::RPath) -> Result<()> {
+            self.inner.unlink(p).await
+        }
+        async fn rmdir(&self, p: &mydrives_core::RPath) -> Result<()> {
+            self.inner.rmdir(p).await
+        }
+        async fn rename(
+            &self,
+            a: &mydrives_core::RPath,
+            b: &mydrives_core::RPath,
+            r: bool,
+        ) -> Result<()> {
+            self.inner.rename(a, b, r).await
+        }
+        async fn statfs(&self) -> Result<mydrives_core::types::FsStat> {
+            self.inner.statfs().await
+        }
+    }
+
+    /// A folder the backend is slow to walk must not stop this server
+    /// answering everything else. The client is told to ask again, the walk
+    /// carries on, and the retry is served from the cache it filled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_listing_does_not_hold_up_the_server() {
+        let slow = SlowList {
+            inner: fixture("t"),
+            delay: Duration::from_millis(600),
+        };
+        let vfs = Vfs::new(Arc::new(slow), VfsOptions::default());
+        let mut b = NfsBridge::new(vfs, "t");
+        b.listing_deadline = Duration::from_millis(100);
+
+        let started = Instant::now();
+        let first = b.readdir(ROOT_INO, 0, 100).await;
+        assert!(
+            matches!(first, Err(nfsstat3::NFS3ERR_JUKEBOX)),
+            "a walk past the deadline must ask the client to retry, got {first:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "the answer has to come back long before the walk finishes"
+        );
+
+        // The point of all this: other work is still served while the walk runs.
+        let meanwhile = Instant::now();
+        b.getattr(ROOT_INO).await.expect("getattr while listing");
+        assert!(
+            meanwhile.elapsed() < Duration::from_millis(300),
+            "the server was blocked by the slow listing"
+        );
+
+        // A retry arriving before the walk finishes must not start a second one.
+        assert!(matches!(
+            b.readdir(ROOT_INO, 0, 100).await,
+            Err(nfsstat3::NFS3ERR_JUKEBOX)
+        ));
+
+        // Once it finishes, the answer is there - whole, never partial.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let done = b.readdir(ROOT_INO, 0, 100).await.expect("the retry is served");
+        assert!(done.end);
+        assert!(!done.entries.is_empty());
     }
 
     #[test]
