@@ -107,6 +107,18 @@ impl Backend for Timed {
     async fn readdir(&self, path: &RPath) -> Result<Vec<DirEntry>> {
         timed!(self, "readdir", path.as_str(), self.inner.readdir(path))
     }
+    async fn readdir_pages(
+        &self,
+        path: &RPath,
+        pages: tokio::sync::mpsc::Sender<Vec<DirEntry>>,
+    ) -> Result<()> {
+        timed!(
+            self,
+            "readdir_pages",
+            path.as_str(),
+            self.inner.readdir_pages(path, pages)
+        )
+    }
     async fn open(&self, path: &RPath, opts: OpenOpts) -> Result<BFile> {
         timed!(self, "open", path.as_str(), self.inner.open(path, opts))
     }

@@ -99,6 +99,20 @@ pub trait CloudApi: Send + Sync + 'static {
     async fn connect(&self) -> Result<()>;
     /// Every item directly inside `folder`, all pages.
     async fn list(&self, folder: &str) -> Result<Vec<Item>>;
+    /// Every item directly inside `folder`, a page at a time.
+    ///
+    /// The default is the whole listing as one page, which is right for a
+    /// service that answers in one request. Override it where the API pages -
+    /// the caller can then show what has arrived instead of waiting for the
+    /// last page. Pages must only ever append to what came before.
+    async fn list_pages(
+        &self,
+        folder: &str,
+        pages: tokio::sync::mpsc::Sender<Vec<Item>>,
+    ) -> Result<()> {
+        let _ = pages.send(self.list(folder).await?).await;
+        Ok(())
+    }
     async fn mkdir(&self, parent: &str, name: &str) -> Result<Item>;
     /// Removes a file, or an empty folder.
     async fn delete(&self, id: &str) -> Result<()>;
@@ -313,6 +327,14 @@ impl<A: CloudApi> CloudBackend<A> {
         Ok(items)
     }
 
+
+    /// One listing row, as the layers above want it.
+    fn entry_of(i: &Item) -> DirEntry {
+        DirEntry {
+            name: i.name.clone(),
+            attr: i.attr(),
+        }
+    }
     fn forget(&self, dir: &RPath) {
         self.listings.lock().remove(dir.as_str());
     }
@@ -456,13 +478,60 @@ impl<A: CloudApi> Backend for CloudBackend<A> {
 
     async fn readdir(&self, path: &RPath) -> Result<Vec<DirEntry>> {
         let items = self.listing_of(path).await?;
-        Ok(items
-            .iter()
-            .map(|i| DirEntry {
-                name: i.name.clone(),
-                attr: i.attr(),
-            })
-            .collect())
+        Ok(items.iter().map(Self::entry_of).collect())
+    }
+
+    /// Streams the pages the service gives us, and caches the whole listing
+    /// once the last one is in.
+    ///
+    /// The cache is only written at the end on purpose: a half-finished
+    /// listing in it would be served to the next caller as if it were the
+    /// folder's full contents.
+    async fn readdir_pages(
+        &self,
+        path: &RPath,
+        pages: tokio::sync::mpsc::Sender<Vec<DirEntry>>,
+    ) -> Result<()> {
+        // Take the answer out from under the lock before awaiting on it: a
+        // guard held across an await would make this future non-Send, and
+        // would hold every other caller of this cache off meanwhile.
+        let cached = {
+            let listings = self.listings.lock();
+            listings
+                .get(path.as_str())
+                .filter(|l| l.at.elapsed() <= LISTING_TTL)
+                .map(|l| l.items.iter().map(Self::entry_of).collect::<Vec<_>>())
+        };
+        if let Some(all) = cached {
+            let _ = pages.send(all).await;
+            return Ok(());
+        }
+        let folder = self.item_of(path).await?;
+        if folder.kind != FileKind::Dir {
+            return Err(Error::NotADirectory(path.to_string()));
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<Item>>(4);
+        let walk = self.api.list_pages(&folder.id, tx);
+        let mut all: Vec<Item> = Vec::new();
+        let relay = async {
+            while let Some(page) = rx.recv().await {
+                let entries: Vec<DirEntry> = page.iter().map(Self::entry_of).collect();
+                all.extend(page);
+                if pages.send(entries).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let (walked, ()) = tokio::join!(walk, relay);
+        walked?;
+        self.listings.lock().insert(
+            path.as_str().to_string(),
+            Listing {
+                items: Arc::new(all),
+                at: Instant::now(),
+            },
+        );
+        Ok(())
     }
 
     async fn open(&self, path: &RPath, opts: OpenOpts) -> Result<BFile> {

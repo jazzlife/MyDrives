@@ -386,7 +386,10 @@ impl NfsBridge {
     /// protocol's own "busy, retry" - while the walk keeps going and fills the
     /// VFS cache, so the retry is served from there. Nothing is cancelled and
     /// no partial listing is ever returned.
-    async fn listing(&self, dirid: fileid3) -> std::result::Result<Vec<(Ino, mydrives_core::types::DirEntry)>, nfsstat3> {
+    async fn listing(
+        &self,
+        dirid: fileid3,
+    ) -> std::result::Result<(Vec<(Ino, mydrives_core::types::DirEntry)>, bool), nfsstat3> {
         // Already walking this one: do not start the same walk twice.
         if !self.listing.lock().insert(dirid) {
             return Err(nfsstat3::NFS3ERR_JUKEBOX);
@@ -402,10 +405,17 @@ impl NfsBridge {
             r
         });
         match tokio::time::timeout(self.listing_deadline, walk).await {
-            Ok(Ok(entries)) => entries.map_err(status),
+            Ok(Ok(entries)) => entries.map(|e| (e, true)).map_err(status),
             // The task itself fell over; the set entry went with it.
             Ok(Err(_)) => Err(nfsstat3::NFS3ERR_IO),
-            Err(_) => Err(nfsstat3::NFS3ERR_JUKEBOX),
+            // Still walking. Hand over the pages that have landed and say the
+            // listing is not finished; the client comes back for the rest with
+            // a cursor, which is how NFS reads a directory anyway. With
+            // nothing to show yet, ask it to retry instead.
+            Err(_) => match self.vfs.partial_readdir(dirid) {
+                Some(sofar) if !sofar.is_empty() => Ok((sofar, false)),
+                _ => Err(nfsstat3::NFS3ERR_JUKEBOX),
+            },
         }
     }
 
@@ -843,7 +853,7 @@ impl NFSFileSystem for NfsBridge {
         start_after: fileid3,
         max_entries: usize,
     ) -> std::result::Result<ReadDirResult, nfsstat3> {
-        let mut entries = self.listing(dirid).await?;
+        let (mut entries, complete) = self.listing(dirid).await?;
         // NFS requires a deterministic order across paginated calls.
         entries.sort_by(|a, b| a.1.name.cmp(&b.1.name));
 
@@ -868,7 +878,9 @@ impl NFSFileSystem for NfsBridge {
             .collect();
         Ok(ReadDirResult {
             entries: out,
-            end: end >= entries.len(),
+            // Never "that is all" while pages are still coming in, or the
+            // client stops asking and shows a folder missing its tail.
+            end: complete && end >= entries.len(),
         })
     }
 
@@ -1008,6 +1020,95 @@ mod tests {
     /// A folder the backend is slow to walk must not stop this server
     /// answering everything else. The client is told to ask again, the walk
     /// carries on, and the retry is served from the cache it filled.
+
+    /// A backend that pages, the way a cloud listing API does.
+    struct Paged {
+        inner: mydrives_core::backends::mem::MemBackend,
+        per_page: Duration,
+    }
+
+    #[async_trait]
+    impl mydrives_core::Backend for Paged {
+        fn id(&self) -> &str { self.inner.id() }
+        fn describe(&self) -> String { self.inner.describe() }
+        fn caps(&self) -> mydrives_core::types::Caps { self.inner.caps() }
+        async fn connect(&self) -> Result<()> { self.inner.connect().await }
+        async fn disconnect(&self) -> Result<()> { self.inner.disconnect().await }
+        async fn stat(&self, p: &mydrives_core::RPath) -> Result<Attr> { self.inner.stat(p).await }
+        async fn readdir(&self, p: &mydrives_core::RPath) -> Result<Vec<mydrives_core::types::DirEntry>> {
+            self.inner.readdir(p).await
+        }
+        /// One entry per page, each page costing a round trip.
+        async fn readdir_pages(
+            &self,
+            p: &mydrives_core::RPath,
+            pages: tokio::sync::mpsc::Sender<Vec<mydrives_core::types::DirEntry>>,
+        ) -> Result<()> {
+            let mut all = self.inner.readdir(p).await?;
+            all.sort_by(|a, b| a.name.cmp(&b.name));
+            for e in all {
+                tokio::time::sleep(self.per_page).await;
+                if pages.send(vec![e]).await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        async fn open(&self, p: &mydrives_core::RPath, o: OpenOpts) -> Result<mydrives_core::BFile> { self.inner.open(p, o).await }
+        async fn create(&self, p: &mydrives_core::RPath) -> Result<mydrives_core::BFile> { self.inner.create(p).await }
+        async fn read_at(&self, f: mydrives_core::BFile, o: u64, l: u32) -> Result<Vec<u8>> { self.inner.read_at(f, o, l).await }
+        async fn write_at(&self, f: mydrives_core::BFile, o: u64, d: &[u8]) -> Result<u32> { self.inner.write_at(f, o, d).await }
+        async fn flush(&self, f: mydrives_core::BFile) -> Result<()> { self.inner.flush(f).await }
+        async fn close(&self, f: mydrives_core::BFile) -> Result<()> { self.inner.close(f).await }
+        async fn set_len(&self, p: &mydrives_core::RPath, f: Option<mydrives_core::BFile>, l: u64) -> Result<()> { self.inner.set_len(p, f, l).await }
+        async fn set_attr(&self, p: &mydrives_core::RPath, f: Option<mydrives_core::BFile>, a: &SetAttr) -> Result<()> { self.inner.set_attr(p, f, a).await }
+        async fn mkdir(&self, p: &mydrives_core::RPath) -> Result<()> { self.inner.mkdir(p).await }
+        async fn unlink(&self, p: &mydrives_core::RPath) -> Result<()> { self.inner.unlink(p).await }
+        async fn rmdir(&self, p: &mydrives_core::RPath) -> Result<()> { self.inner.rmdir(p).await }
+        async fn rename(&self, a: &mydrives_core::RPath, b: &mydrives_core::RPath, r: bool) -> Result<()> { self.inner.rename(a, b, r).await }
+        async fn statfs(&self) -> Result<mydrives_core::types::FsStat> { self.inner.statfs().await }
+    }
+
+    /// The point of streaming: the client gets the entries that have arrived
+    /// instead of nothing, and is told the listing is not finished so it
+    /// comes back for the rest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_paging_backend_hands_over_what_has_arrived() {
+        let vfs = Vfs::new(
+            Arc::new(Paged {
+                inner: fixture("t"),
+                per_page: Duration::from_millis(150),
+            }),
+            VfsOptions::default(),
+        );
+        let mut b = NfsBridge::new(vfs, "t");
+        b.listing_deadline = Duration::from_millis(250);
+
+        // Past the deadline only the first page or two have landed.
+        let early = b.readdir(ROOT_INO, 0, 100).await.expect("a partial listing");
+        assert!(!early.entries.is_empty(), "nothing was handed over");
+        assert!(!early.end, "an unfinished listing must not claim to be the end");
+
+        // Let the walk finish; the complete answer follows, and it is a
+        // superset of what was shown early.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let full = b.readdir(ROOT_INO, 0, 100).await.expect("the finished listing");
+        assert!(full.end, "a finished listing has to say so");
+        assert!(
+            full.entries.len() >= early.entries.len(),
+            "the folder shrank: {} then {}",
+            early.entries.len(),
+            full.entries.len()
+        );
+        // Every entry shown early is still there, under the same id, so a
+        // client that paged from one of them does not lose its place.
+        for e in &early.entries {
+            assert!(
+                full.entries.iter().any(|f| f.fileid == e.fileid),
+                "an entry shown early vanished from the finished listing"
+            );
+        }
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_slow_listing_does_not_hold_up_the_server() {
         let slow = SlowList {

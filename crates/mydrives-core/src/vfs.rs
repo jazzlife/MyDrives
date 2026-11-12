@@ -143,6 +143,8 @@ pub struct Vfs {
     /// version. Observed as the first read after `dd` differing from every later
     /// read, with the server holding the correct bytes all along.
     size_floors: Mutex<HashMap<String, u64>>,
+    /// Listings being walked right now, with the pages that have arrived.
+    partials: Mutex<HashMap<String, Arc<Vec<DirEntry>>>>,
     next_fh: AtomicU64,
     counters: Counters,
 }
@@ -157,6 +159,7 @@ impl Vfs {
             handles: Mutex::new(HashMap::new()),
             epochs: Mutex::new(HashMap::new()),
             size_floors: Mutex::new(HashMap::new()),
+            partials: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             counters: Counters::default(),
         })
@@ -338,15 +341,57 @@ impl Vfs {
         Ok(self.with_floor(path, attr))
     }
 
+    /// The directory's entries, walking the backend a page at a time.
+    ///
+    /// A backend that answers in one piece sends one page, so this is the
+    /// same two steps it always was. One that pages publishes what has
+    /// arrived as it goes, and [`partial_readdir`] hands that to a caller
+    /// that would rather show half a folder now than all of it in half a
+    /// minute.
+    ///
+    /// Only the finished listing reaches the cache: a half-written one there
+    /// would be served to the next caller as the folder's full contents.
     pub async fn readdir_path(&self, path: &RPath) -> Result<Arc<Vec<DirEntry>>> {
         if let Some(entries) = self.meta.dir(path) {
             self.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(entries);
         }
-        let entries = Arc::new(self.count_call(self.backend.readdir(path).await)?);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<DirEntry>>(4);
+        let walk = self.backend.readdir_pages(path, tx);
+        let gather = async {
+            let mut all: Vec<DirEntry> = Vec::new();
+            while let Some(page) = rx.recv().await {
+                all.extend(page);
+                self.partials
+                    .lock()
+                    .insert(path.as_str().to_string(), Arc::new(all.clone()));
+            }
+            all
+        };
+        let (walked, all) = tokio::join!(walk, gather);
+        self.partials.lock().remove(path.as_str());
+        self.count_call(walked)?;
+        let entries = Arc::new(all);
         self.meta.put_dir(path, entries.clone());
         Ok(entries)
     }
+
+    /// What has arrived so far for a listing still being walked, in the same
+    /// shape [`readdir`] returns. `None` once it has finished - the answer is
+    /// in the cache by then - or if it never started.
+    pub fn partial_readdir(&self, ino: Ino) -> Option<Vec<(Ino, DirEntry)>> {
+        let path = self.path_of(ino).ok()?;
+        let entries = self.partials.lock().get(path.as_str()).cloned()?;
+        let mut out = Vec::with_capacity(entries.len());
+        let mut table = self.inodes.lock();
+        for e in entries.iter() {
+            let child = path.join(&e.name);
+            let child_ino = table.intern(&child, e.attr.kind);
+            out.push((child_ino, e.clone()));
+        }
+        Some(out)
+    }
+
 
     pub async fn open_path(&self, path: &RPath, opts: OpenOpts) -> Result<Fh> {
         if opts.write || opts.truncate {

@@ -304,6 +304,51 @@ impl CloudApi for GdriveApi {
         self.quota().await.map(|_| ())
     }
 
+
+    /// The same walk as [`list`], but each page goes out as it lands.
+    ///
+    /// `orderBy=name` is what makes this safe to stream: Drive returns the
+    /// pages in name order, so every page only ever appends to the ones
+    /// before it and a caller paging through with a cursor cannot miss an
+    /// entry that turns up later.
+    async fn list_pages(
+        &self,
+        folder: &str,
+        pages: tokio::sync::mpsc::Sender<Vec<Item>>,
+    ) -> Result<()> {
+        let q = format!("'{folder}' in parents and trashed = false");
+        let fields = format!("nextPageToken,files({FIELDS})");
+        let mut token: Option<String> = None;
+        loop {
+            let page: ListPage = self
+                .json(
+                    || {
+                        let mut req = self.http.get(self.url("/drive/v3/files")).query(&[
+                            ("q", q.as_str()),
+                            ("fields", fields.as_str()),
+                            ("pageSize", "1000"),
+                            ("orderBy", "name"),
+                        ]);
+                        if let Some(t) = &token {
+                            req = req.query(&[("pageToken", t)]);
+                        }
+                        req
+                    },
+                    "목록",
+                )
+                .await?;
+            let items: Vec<Item> = page.files.into_iter().filter_map(Item::from_file).collect();
+            // Nobody left to hand it to: stop walking rather than pay for
+            // pages no one will read.
+            if pages.send(items).await.is_err() {
+                return Ok(());
+            }
+            match page.next_page_token {
+                Some(t) if !t.is_empty() => token = Some(t),
+                _ => return Ok(()),
+            }
+        }
+    }
     async fn list(&self, folder: &str) -> Result<Vec<Item>> {
         let q = format!("'{folder}' in parents and trashed = false");
         let fields = format!("nextPageToken,files({FIELDS})");
