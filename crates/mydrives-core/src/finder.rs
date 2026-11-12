@@ -86,18 +86,33 @@ mod macos {
             return Ok(false);
         }
         let wanted = normalize(mountpoint);
-        // Already pinned - in either list - means nothing to do, and no
-        // Finder restart.
-        for list_name in [LOCATIONS, FAVORITES] {
-            if let Some(list) = read_list(list_name)? {
-                if list.items().any(|item| item_points_at(item, &wanted)) {
-                    return Ok(false);
-                }
+        let wanted_label = mountpoint
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned());
+        // A pin macOS keeps in the Locations list is its own business.
+        if let Some(list) = read_list(LOCATIONS)? {
+            if list.items().any(|item| item_points_at(item, &wanted)) {
+                return Ok(false);
             }
         }
         let Some(mut list) = read_list(FAVORITES)? else {
             return Err(Error::Backend(format!("{FAVORITES} does not exist")));
         };
+        // Being in the list is not enough: the row's label lives in the
+        // bookmark, so one recorded while the mounts were still settling keeps
+        // whichever drive macOS resolved at the time. Five drives all read
+        // "QNAP" that way, and returning early here meant the wrong label
+        // never healed. Drop a pin whose label has gone stale and make it
+        // again from the live mount.
+        if list.items().any(|item| item_points_at(item, &wanted)) {
+            let correct = list.items().any(|item| {
+                item_points_at(item, &wanted) && item_label(item) == wanted_label
+            });
+            if correct {
+                return Ok(false);
+            }
+            list.retain_items(|item| !item_points_at(item, &wanted));
+        }
         let bookmark = super::bookmark::create(mountpoint)?;
         list.push_item(Node::Dict {
             mutable: false,
@@ -179,6 +194,20 @@ mod macos {
         std::fs::write(&tmp, bytes)
             .and_then(|()| std::fs::rename(&tmp, &path))
             .map_err(|e| Error::Backend(format!("write {}: {e}", path.display())))
+    }
+
+    /// The label this list item will show, as baked into its bookmark.
+    fn item_label(item: &Node) -> Option<String> {
+        let Node::Dict { entries, .. } = item else {
+            return None;
+        };
+        entries
+            .iter()
+            .find(|(k, _)| k == "Bookmark")
+            .and_then(|(_, v)| match v {
+                Node::Data(d) => super::bookmark::label(d),
+                _ => None,
+            })
     }
 
     /// Does this list item's bookmark point at `wanted`?
@@ -306,6 +335,31 @@ mod bookmark {
     const UTF8: u32 = 0x0800_0100;
     /// `kCFURLPathKey`: the path stored inside a bookmark when it was made.
     const PATH_KEY: &[u8] = b"_NSURLPathKey\0";
+    const NAME_KEY: &[u8] = b"_NSURLNameKey\0";
+
+    /// `kCFURLNameKey`: the label Finder shows for the row. It is baked into
+    /// the bookmark when it is made, which is why a pin recorded while the
+    /// mounts were still settling keeps another drive's name for good.
+    unsafe fn recorded_name(data: CFTypeRef) -> Option<String> {
+        let key = Owned(CFStringCreateWithCString(std::ptr::null(), NAME_KEY.as_ptr(), UTF8));
+        if key.0.is_null() {
+            return None;
+        }
+        let value = Owned(CFURLCreateResourcePropertyForKeyFromBookmarkData(
+            std::ptr::null(),
+            key.0,
+            data,
+        ));
+        if value.0.is_null() || CFGetTypeID(value.0) != CFStringGetTypeID() {
+            return None;
+        }
+        let mut buf = vec![0u8; 1024];
+        if CFStringGetCString(value.0, buf.as_mut_ptr(), buf.len() as c_long, UTF8) == 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8(buf[..end].to_vec()).ok().filter(|s| !s.is_empty())
+    }
 
     unsafe fn recorded_path(data: CFTypeRef) -> Option<PathBuf> {
         use std::os::unix::ffi::OsStrExt;
@@ -381,6 +435,21 @@ mod bookmark {
     /// whether or not the volume is mounted right now, and a drive is taken
     /// out of the sidebar precisely when it is *not* mounted. Resolving is the
     /// fallback for a bookmark made by something that left the path out.
+    /// The label a stored bookmark carries, without resolving it.
+    pub fn label(bookmark: &[u8]) -> Option<String> {
+        unsafe {
+            let data = Owned(CFDataCreate(
+                std::ptr::null(),
+                bookmark.as_ptr(),
+                bookmark.len() as c_long,
+            ));
+            if data.0.is_null() {
+                return None;
+            }
+            recorded_name(data.0)
+        }
+    }
+
     pub fn resolve(bookmark: &[u8]) -> Option<PathBuf> {
         use std::os::unix::ffi::OsStrExt;
         unsafe {
