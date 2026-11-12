@@ -104,7 +104,7 @@ fn keychain_get(remote_id: &str) -> Result<Option<String>> {
                 password.pop();
             }
         }
-        return Ok(Some(password));
+        return Ok(Some(decode_if_hex_dump(remote_id, password)));
     }
     if out.status.code() == Some(44) {
         return Ok(None);
@@ -115,6 +115,74 @@ fn keychain_get(remote_id: &str) -> Result<Option<String>> {
     )))
 }
 
+
+/// Turns `security`'s hex dump back into the password it stands for.
+///
+/// `security find-generic-password -w` prints the value as text only while it
+/// is printable; anything else - a Korean or accented password, one with a
+/// newline in it - comes out as a bare hex dump. The agent used to hand that
+/// dump to the server as the password, so a non-ASCII password could never
+/// authenticate, and `keychain_set`'s read-back saw 24 characters where it
+/// wrote 12 and fell back to a write that re-prompts on every rebuild.
+///
+/// A password may legitimately look like hex ("deadbeef"), so the shape alone
+/// cannot decide it. `-g` can: it quotes a text value and prefixes a dumped
+/// one with `0x`. That second call only happens for a value that *could* be a
+/// dump, which is rare, so the ordinary read stays one call.
+#[cfg(target_os = "macos")]
+fn decode_if_hex_dump(remote_id: &str, value: String) -> String {
+    let could_be = !value.is_empty()
+        && value.len() % 2 == 0
+        && value.bytes().all(|b| b.is_ascii_hexdigit());
+    if !could_be {
+        return value;
+    }
+    let Ok(out) = std::process::Command::new("/usr/bin/security")
+        .arg("find-generic-password")
+        .args(["-s", SERVICE])
+        .args(["-a", remote_id])
+        .arg("-g")
+        .output()
+    else {
+        return value;
+    };
+    // `-g` writes the attributes to stderr.
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let dumped = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("password: "))
+        .is_some_and(|v| v.starts_with("0x"));
+    if !dumped {
+        return value;
+    }
+    match hex_to_string(&value) {
+        Some(decoded) => decoded,
+        // Bytes that are not text after all. Nothing sensible to return but
+        // what we were given; the caller will fail to authenticate and say so,
+        // which beats pretending.
+        None => {
+            tracing::warn!(
+                remote = remote_id,
+                "the stored password is not text; using it as it came back"
+            );
+            value
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn hex_to_string(hex: &str) -> Option<String> {
+    let bytes: Option<Vec<u8>> = hex
+        .as_bytes()
+        .chunks(2)
+        .map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok())
+        .collect();
+    String::from_utf8(bytes?).ok()
+}
 #[cfg(target_os = "windows")]
 fn keychain_set(remote_id: &str, secret: &str) -> Result<()> {
     entry(remote_id)?
@@ -505,6 +573,23 @@ fn keychain_delete(remote_id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `security` prints a non-printable value as a hex dump, so the decoder
+    /// has to turn it back. A password that merely looks like hex must be
+    /// left alone, which is why the shape alone never decides it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_hex_dump_becomes_the_bytes_it_stands_for() {
+        // "비밀번호" and "two\nlines", as `security -w` prints them.
+        assert_eq!(hex_to_string("ebb984ebb080ebb288ed98b8").as_deref(), Some("비밀번호"));
+        assert_eq!(hex_to_string("74776f0a6c696e6573").as_deref(), Some("two\nlines"));
+        assert_eq!(hex_to_string("EBB984EBB080EBB288ED98B8").as_deref(), Some("비밀번호"));
+        // Not a dump at all.
+        assert_eq!(hex_to_string("zz").as_deref(), None);
+        assert_eq!(hex_to_string("abc").as_deref(), None);
+        // Valid hex whose bytes are not text: the caller keeps the raw form.
+        assert_eq!(hex_to_string("ff").as_deref(), None);
+    }
     use super::*;
 
     #[test]
