@@ -99,6 +99,65 @@ async fn a_refusal_in_the_browser_is_an_auth_error_not_a_hang() {
     }
 }
 
+/// A browser does not promise to hand the whole request line over in one
+/// packet. Split it right before the `?` - the worst place, because the server
+/// used to decide there was no query at all, answer 404 and drop the
+/// connection, leaving the sign-in to sit until it timed out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redirect_split_across_tcp_segments_still_arrives() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("code=split-code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "at-split", "expires_in": 3600, "token_type": "Bearer"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let split_browser = |url: &str| -> mydrives_core::error::Result<()> {
+        let (_, query) = url.split_once('?').unwrap();
+        let get = |k: &str| {
+            query
+                .split('&')
+                .find_map(|p| p.strip_prefix(&format!("{k}=")))
+                .map(str::to_string)
+        };
+        let redirect = get("redirect_uri")
+            .unwrap()
+            .replace("%3A", ":")
+            .replace("%2F", "/")
+            .trim_end_matches('/')
+            .to_string();
+        let state = get("state").unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let host = redirect.strip_prefix("http://").unwrap().to_string();
+            let mut s = std::net::TcpStream::connect(&host).expect("connect");
+            // The first segment stops immediately before the query marker.
+            write!(s, "GET /").unwrap();
+            s.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+            write!(
+                s,
+                "?code=split-code&state={state} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            s.flush().unwrap();
+            let mut out = String::new();
+            let _ = s.read_to_string(&mut out);
+            assert!(out.contains("로그인 완료"), "{out}");
+        });
+        Ok(())
+    };
+
+    let tokens = authorize(&provider(&server), Duration::from_secs(10), split_browser)
+        .await
+        .expect("a request split across segments must still be understood");
+    assert_eq!(tokens.access_token, "at-split");
+}
+
 #[tokio::test]
 async fn a_session_refreshes_a_token_about_to_expire_and_keeps_the_new_set() {
     let server = MockServer::start().await;

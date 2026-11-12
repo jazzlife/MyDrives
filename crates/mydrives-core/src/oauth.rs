@@ -416,6 +416,34 @@ pub async fn authorize(
     .await
 }
 
+/// Reads a request's head off the socket.
+///
+/// One `read` is not one request: TCP may split the line anywhere, and a
+/// redirect whose `?` landed in the second segment used to be answered 404 and
+/// the connection dropped - the sign-in then sat there until it timed out.
+/// Measured as a one-in-three failure in the end-to-end test.
+///
+/// Reads until the blank line that ends the headers, with a cap so a client
+/// that never stops talking cannot grow this without bound, and a deadline so
+/// one silent connection cannot hold up the redirect that matters.
+async fn read_head(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    const CAP: usize = 16 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 2048];
+    while buf.len() < CAP {
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk)).await {
+            // EOF, or nothing more coming: use whatever arrived.
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(Err(_)) => return None,
+        }
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Accepts the browser's return visit and takes `code` and `state` from it.
 /// Answers with a small page so the tab does not sit on a blank screen.
 async fn wait_for_redirect(
@@ -431,9 +459,11 @@ async fn wait_for_redirect(
             None => listener.accept().await,
         }
         .map_err(Error::Io)?;
-        let mut buf = vec![0u8; 8192];
-        let n = stream.read(&mut buf).await.map_err(Error::Io)?;
-        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        // A connection that never sends a usable head is not fatal: a browser
+        // opens a few, and only the one carrying the query matters.
+        let Some(request) = read_head(&mut stream).await else {
+            continue;
+        };
         let target = request
             .lines()
             .next()
