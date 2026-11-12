@@ -144,6 +144,8 @@ pub trait CloudApi: Send + Sync + 'static {
 /// folder it is showing far more often than the folder changes. Ten
 /// seconds meant a window left open re-listed itself all day.
 const LISTING_TTL: Duration = Duration::from_secs(60);
+/// The longest a listing is kept however dear it was to fetch.
+const LISTING_TTL_MAX: Duration = Duration::from_secs(15 * 60);
 
 /// How much is fetched when a read misses the block already in hand.
 ///
@@ -154,6 +156,24 @@ const READ_AHEAD: u32 = 4 * 1024 * 1024;
 struct Listing {
     items: Arc<Vec<Item>>,
     at: Instant,
+    /// What this listing cost to fetch.
+    cost: Duration,
+}
+
+impl Listing {
+    /// Whether this listing may still be served.
+    ///
+    /// A folder answered in a moment can be re-read freely. One that took
+    /// half a minute to walk - 24 pages and 23,362 entries, measured here -
+    /// must not be thrown away sixty seconds later only to cost that again;
+    /// being a little behind on a folder nobody is changing is far cheaper
+    /// than making the user wait through the walk twice. Our own writes drop
+    /// the entry outright, so this only delays noticing a change made
+    /// somewhere else.
+    fn fresh(&self) -> bool {
+        let keep = LISTING_TTL.max(self.cost * 20).min(LISTING_TTL_MAX);
+        self.at.elapsed() <= keep
+    }
 }
 
 struct OpenFile {
@@ -297,7 +317,7 @@ impl<A: CloudApi> CloudBackend<A> {
     /// The listing of the folder at `dir`.
     async fn listing_of(&self, dir: &RPath) -> Result<Arc<Vec<Item>>> {
         if let Some(l) = self.listings.lock().get(dir.as_str()) {
-            if l.at.elapsed() <= LISTING_TTL {
+            if l.fresh() {
                 return Ok(l.items.clone());
             }
         }
@@ -312,16 +332,18 @@ impl<A: CloudApi> CloudBackend<A> {
     /// fresh.
     async fn cached_or_list(&self, dir: &RPath, folder_id: &str) -> Result<Arc<Vec<Item>>> {
         if let Some(l) = self.listings.lock().get(dir.as_str()) {
-            if l.at.elapsed() <= LISTING_TTL {
+            if l.fresh() {
                 return Ok(l.items.clone());
             }
         }
+        let started = Instant::now();
         let items = Arc::new(self.api.list(folder_id).await?);
         self.listings.lock().insert(
             dir.as_str().to_string(),
             Listing {
                 items: items.clone(),
                 at: Instant::now(),
+                cost: started.elapsed(),
             },
         );
         Ok(items)
@@ -499,7 +521,7 @@ impl<A: CloudApi> Backend for CloudBackend<A> {
             let listings = self.listings.lock();
             listings
                 .get(path.as_str())
-                .filter(|l| l.at.elapsed() <= LISTING_TTL)
+                .filter(|l| l.fresh())
                 .map(|l| l.items.iter().map(Self::entry_of).collect::<Vec<_>>())
         };
         if let Some(all) = cached {
@@ -510,6 +532,7 @@ impl<A: CloudApi> Backend for CloudBackend<A> {
         if folder.kind != FileKind::Dir {
             return Err(Error::NotADirectory(path.to_string()));
         }
+        let started = Instant::now();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<Item>>(4);
         let walk = self.api.list_pages(&folder.id, tx);
         let mut all: Vec<Item> = Vec::new();
@@ -529,6 +552,7 @@ impl<A: CloudApi> Backend for CloudBackend<A> {
             Listing {
                 items: Arc::new(all),
                 at: Instant::now(),
+                cost: started.elapsed(),
             },
         );
         Ok(())
@@ -778,5 +802,38 @@ impl<A: CloudApi> Backend for CloudBackend<A> {
 
     async fn statfs(&self) -> Result<FsStat> {
         self.api.quota().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listing is kept in proportion to what it cost. A folder that
+    /// answered at once can be re-read freely; one that took half a minute
+    /// must not be thrown away a minute later only to cost that again.
+    #[test]
+    fn an_expensive_listing_is_kept_longer_than_a_cheap_one() {
+        let listing = |cost: Duration, age: Duration| Listing {
+            items: Arc::new(Vec::new()),
+            at: Instant::now() - age,
+            cost,
+        };
+        let quick = Duration::from_millis(200);
+        let dear = Duration::from_secs(33);
+
+        // Inside the ordinary window, both are good.
+        assert!(listing(quick, Duration::from_secs(30)).fresh());
+        assert!(listing(dear, Duration::from_secs(30)).fresh());
+
+        // Past it, a cheap listing goes - re-reading costs nothing.
+        assert!(!listing(quick, Duration::from_secs(61)).fresh());
+        // ...and an expensive one stays.
+        assert!(listing(dear, Duration::from_secs(61)).fresh());
+        assert!(listing(dear, Duration::from_secs(9 * 60)).fresh());
+
+        // But not for ever, however dear it was.
+        assert!(!listing(dear, Duration::from_secs(16 * 60)).fresh());
+        assert!(!listing(Duration::from_secs(600), Duration::from_secs(16 * 60)).fresh());
     }
 }
