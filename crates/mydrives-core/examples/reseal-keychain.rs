@@ -1,15 +1,15 @@
-//! Rewrite each drive's stored secret through the no-ACL path.
+//! Rewrite each drive's stored secret so the reader is also its creator.
 //!
-//! An item written by the keyring fallback is pinned to the code signature of
-//! the build that wrote it, so the next build - or the next token refresh,
-//! which rewrites the item - throws away the access the user granted and the
-//! drive drops at the following read. Items written without an ACL do not have
-//! that problem; the description attribute tells the two apart ("MyDrives
-//! password" versus empty).
+//! A keychain item's **partition list** - the code identities that may open it
+//! without asking - starts out holding whoever created the item. Items an older
+//! build wrote from inside the agent therefore name our cdhash and leave out
+//! `apple-tool:`, the identity of the `/usr/bin/security` that reads them, so
+//! every read raises the dialog that asks for the login keychain password (see
+//! `docs/DECISIONS.md` §17).
 //!
-//! This reads each secret while it is still readable and stores it again, so
-//! the conversion costs no authorisation dialog. Run it once, with the agent
-//! stopped:
+//! This reads each secret while it is still readable and stores it again, now
+//! through `security`, so the conversion costs no authorisation dialog. Run it
+//! once, with the agent stopped:
 //!
 //!   cargo run -p mydrives-core --example reseal-keychain
 use mydrives_core::config::SecretRef;
@@ -69,16 +69,15 @@ fn main() {
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
+        // A read right after the write is the thing that used to ask, so a
+        // value that comes back whole is the proof the conversion worked.
         let intact = back.as_deref() == Some(value.as_str());
-        let sealed = after.contains("MyDrives password");
         let len = value.len();
-        println!(
-            "{id:14} {len} bytes  desc {before} -> {after}  value intact={intact}  no-ACL={sealed}"
-        );
-        if !intact || !sealed {
+        println!("{id:14} {len} bytes  desc {before} -> {after}  value intact={intact}");
+        if !intact {
             failed += 1;
         }
     }
-    println!("\n{} drive(s) still not on the no-ACL path", failed);
+    println!("\n{failed} drive(s) whose secret could not be rewritten");
     std::process::exit(if failed == 0 { 0 } else { 1 });
 }

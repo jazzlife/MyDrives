@@ -18,11 +18,10 @@ use mydrives_backend_smb::{SmbBackend, SmbTarget};
 
 /// How long to wait for the OS credential store.
 ///
-/// Reading the Keychain can block indefinitely: macOS asks the user to allow
-/// access whenever the calling binary's signature changes (every rebuild during
-/// development, and every update in production), and the call does not return
-/// until that dialog is answered. Blocking a mount forever on it - with no
-/// message anywhere - is worse than failing with an explanation.
+/// Reading the Keychain can block indefinitely: macOS asks the user before it
+/// hands an item to a reader the item does not already name, and the call does
+/// not return until that dialog is answered. Blocking a mount forever on it -
+/// with no message anywhere - is worse than failing with an explanation.
 const SECRET_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn load_secret(

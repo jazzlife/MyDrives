@@ -63,14 +63,13 @@ fn keychain_get(remote_id: &str) -> Result<Option<String>> {
 /// Reads the password back through `/usr/bin/security`, not through the
 /// Security framework.
 ///
-/// Measured on macOS 26: an item stored with an open access list (`-A`) is
-/// still protected against a *library* read - calling `SecKeychainItemCopy…`
-/// from our own binary raises "<binary> wants to access key app.MyDrives in
-/// your keychain", and the binary's identity changes with every rebuild, so the
-/// dialog comes back forever. The same item read through `/usr/bin/security`
-/// returns immediately. The agent therefore talks to the keychain the way the
-/// `security` tool does: one stable, Apple-signed reader, and no identity of
-/// ours for the keychain to object to.
+/// Measured on macOS 26: a read from our own binary raises "<binary> wants to
+/// access key app.MyDrives in your keychain", and our identity changes with
+/// every rebuild and every update, so the dialog comes back forever. An
+/// Apple-signed tool has one identity that never changes, so the agent talks
+/// to the keychain the way `security` does and keeps its own identity out of
+/// the decision. [`keychain_set`] creates the item through the same tool, which
+/// is what keeps this read from asking.
 ///
 /// `security` exits 44 when the item does not exist, which is a legitimate
 /// answer ("no password configured"), not a failure.
@@ -190,29 +189,51 @@ fn keychain_set(remote_id: &str, secret: &str) -> Result<()> {
         .map_err(|e| Error::Backend(format!("keychain write {remote_id}: {e}")))
 }
 
-/// Stores the password in the login keychain with an access list that does not
-/// pin it to one binary.
+/// Stores the password by letting `/usr/bin/security` create the item.
 ///
-/// macOS attaches an ACL to each keychain item naming the application that
-/// created it, identified by its code signature. The agent's signature changes
-/// with every build and every update, so the next read raises the "… wants to
-/// use your confidential information" dialog - and if the agent is running
-/// somewhere that cannot show a dialog, the read simply blocks forever. We saw
-/// both: the prompt on a rebuild, and a hung mount when no dialog could appear.
+/// Every keychain item carries, besides its access list, a **partition list**:
+/// the set of code identities allowed to open it without asking. The list is
+/// fixed when the item is created and starts out holding the identity of
+/// whoever created it - `teamid:…` for a signed app, `cdhash:…` for an ad-hoc
+/// build, `apple-tool:` for one of Apple's command line tools. A reader whose
+/// identity is not on the list gets the dialog that asks for the login
+/// keychain password, and the read blocks until it is answered.
 ///
-/// So the item is written with an ACL that names no application at all, which
-/// means "any application running as this user may read it without prompting".
-/// The trade-off is deliberate and worth stating: a different program running as
-/// the same user could read the password without the user being asked. That is
-/// already true of the config file, the mount itself and the user's own files,
-/// and it is the behaviour every always-on drive agent needs.
+/// The agent reads through `/usr/bin/security` (see [`keychain_get`]), whose
+/// identity is `apple-tool:`. Creating the item from *our* process put our own
+/// cdhash on the list and left `apple-tool:` off it, so the very next read
+/// asked. Measured on macOS 26 (2026-11-13), straight from the system log:
+///
+/// ```text
+/// mydrivesd  SecKeychainItemCreateFromContent
+/// securityd  ACL partition mismatch: client apple-tool:
+/// securityd  asking user about XARA partition for 'apple-tool:'
+/// securityd  displaying keychain prompt for /usr/bin/security(1661)
+/// ```
+///
+/// Answering "항상 허용" adds `apple-tool:` to *that one item*, and a token
+/// refresh replaces the item, so the dialog came back at the next start of the
+/// agent - three cloud drives, three dialogs, every login. No access list can
+/// fix that: the partition list is a separate check, which is why writing with
+/// no ACL and writing with an ACL that names `security` both still asked.
+///
+/// So the item is created by the same program that reads it. `security` is
+/// Apple-signed and its identity never changes, so the partition list says
+/// `apple-tool:` for good and no build of ours ever has to appear on it.
+///
+/// The trade-off is the one already written down for reading: any program
+/// running as this user can get the password out through `security`. The value
+/// also passes through the command line of a short-lived child, where `ps`
+/// shows it to that same user - the same set of programs that could simply ask
+/// `security` for it. It goes as hex (`-X`) so that a NUL byte or a leading `-`
+/// in a password cannot change what the command means.
 #[cfg(target_os = "macos")]
 fn keychain_set(remote_id: &str, secret: &str) -> Result<()> {
-    // Replace rather than update: updating keeps whatever access list the
-    // existing item already had, including the per-application one an older
-    // build left behind, which is the thing being fixed here.
+    // Delete rather than update: `-U` keeps the partition list of whatever item
+    // is already there, including the one an older build created, which is the
+    // thing being fixed here. A new item starts with a new list.
     let _ = keychain_delete(remote_id);
-    match keychain_set_without_acl(remote_id, secret) {
+    match security_add(remote_id, secret) {
         Ok(()) => {
             // Read it back to catch a short write. `security` is a separate
             // process and does not always see a just-created item on the
@@ -238,30 +259,24 @@ fn keychain_set(remote_id: &str, secret: &str) -> Result<()> {
                 }
             }
             match answer {
-                // Written whole: the item opens with no prompt and nothing was
-                // truncated on the way in.
+                // Written whole, and openable without a dialog - the two
+                // things that have gone wrong here before.
                 Some(ref s) if s == secret => return Ok(()),
-                // A *different* value came back - the old `security -A` path
-                // used to truncate at 128 characters - so the write really is
-                // no good and the library path is worth the prompt it costs.
+                // A *different* value came back. An older writer handed the
+                // value to `security` on stdin, where it was cut off at 128
+                // characters; nothing should truncate it now, so if it happens
+                // the write is no good and the library path is worth the
+                // prompt it costs.
                 Some(s) => tracing::warn!(
                     remote = remote_id,
                     wrote = secret.len(),
                     read_back = s.len(),
                     "the keychain item read back truncated; falling back"
                 ),
-                // Nothing came back. That is a failed *read*, not evidence of
-                // a failed write, and `SecKeychainItemCreateFromContent` already
-                // said it stored the item. Falling back here was actively
-                // harmful: the library write pins the item to this build's code
-                // signature, so every token refresh threw away the access the
-                // user had just granted and the drive dropped at the next read.
-                // Keep the item that was written.
-                // Nothing came back. With the access list naming
-                // `/usr/bin/security` this should not happen, and if it does
-                // the item is one the agent cannot read - exactly the state a
-                // NULL access list used to leave behind. Fall back rather than
-                // keep a password nobody can get at.
+                // Nothing came back at all: the item exists but this reader
+                // cannot open it, which is the state the fix is meant to
+                // prevent. Fall back rather than keep a password nobody can
+                // get at.
                 None => tracing::warn!(
                     remote = remote_id,
                     wrote = secret.len(),
@@ -269,234 +284,53 @@ fn keychain_set(remote_id: &str, secret: &str) -> Result<()> {
                 ),
             }
         }
-        Err(status) => tracing::warn!(
+        Err(e) => tracing::warn!(
             remote = remote_id,
-            status,
-            "could not store the password without an ACL; falling back"
+            error = %e,
+            "could not store the password through /usr/bin/security; falling back"
         ),
     }
 
     let _ = keychain_delete(remote_id);
-    // The library path still works, it just asks the user again after every
-    // update of the app.
+    // The library path still works, it just asks the user again whenever the
+    // signature of the build that reads it differs from the one that wrote it.
     entry(remote_id)?
         .set_password(secret)
         .map_err(|e| Error::Backend(format!("keychain write {remote_id}: {e}")))
 }
 
-/// Writes the item straight through the Security framework with an ACL that
-/// names no application, which is what "any program running as this user may
-/// read this without a prompt" looks like on macOS.
+/// Creates the item with `security add-generic-password`, value as hex.
 ///
-/// This used to shell out to `/usr/bin/security -A` with the value on stdin.
-/// That tool reads a password from stdin through its interactive prompt, and
-/// the prompt stops at **128 characters** (measured on 2026-11-11). Short NAS
-/// and FTP passwords went through; an OAuth token set is a JSON document of
-/// several hundred bytes, so it was silently truncated, the read-back check
-/// failed, and every cloud drive fell back to a write that *does* attach a
-/// per-application ACL. That ACL names the binary by its code signature, so
-/// each new build asked the user for permission all over again.
+/// There is no length limit on the way in: an OAuth token set of a couple of
+/// thousand characters arrives whole, which the writer this replaced - the same
+/// tool with the value on stdin - did not manage.
 #[cfg(target_os = "macos")]
-fn keychain_set_without_acl(remote_id: &str, secret: &str) -> std::result::Result<(), i32> {
-    use std::ffi::c_void;
+fn security_add(remote_id: &str, secret: &str) -> std::result::Result<(), String> {
+    use std::fmt::Write as _;
 
-    type CFTypeRef = *const c_void;
-    type OSStatus = i32;
-
-    #[repr(C)]
-    struct Attribute {
-        tag: u32,
-        length: u32,
-        data: *mut c_void,
+    let mut hex = String::with_capacity(secret.len() * 2);
+    for byte in secret.as_bytes() {
+        let _ = write!(hex, "{byte:02x}");
     }
-    #[repr(C)]
-    struct AttributeList {
-        count: u32,
-        attr: *mut Attribute,
+    let out = std::process::Command::new("/usr/bin/security")
+        .arg("add-generic-password")
+        .args(["-s", SERVICE])
+        .args(["-a", remote_id])
+        .args(["-D", "MyDrives password"])
+        .args(["-X", &hex])
+        // The delete above should have left nothing behind, but a write that
+        // refused because the item is still there would lose a token.
+        .arg("-U")
+        .output()
+        .map_err(|e| format!("running /usr/bin/security: {e}"))?;
+    if out.status.success() {
+        return Ok(());
     }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
-        fn CFRelease(cf: CFTypeRef);
-        fn CFStringCreateWithBytes(
-            alloc: CFTypeRef,
-            bytes: *const u8,
-            num_bytes: isize,
-            encoding: u32,
-            is_external: u8,
-        ) -> CFTypeRef;
-        fn CFArrayGetCount(array: CFTypeRef) -> isize;
-        fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
-        fn CFArrayCreate(
-            alloc: CFTypeRef,
-            values: *const CFTypeRef,
-            num_values: isize,
-            callbacks: *const c_void,
-        ) -> CFTypeRef;
-        static kCFTypeArrayCallBacks: c_void;
-    }
-
-    #[link(name = "Security", kind = "framework")]
-    extern "C" {
-        fn SecKeychainCopyDefault(keychain: *mut CFTypeRef) -> OSStatus;
-        fn SecTrustedApplicationCreateFromPath(
-            path: *const u8,
-            app: *mut CFTypeRef,
-        ) -> OSStatus;
-        fn SecAccessCreate(
-            descriptor: CFTypeRef,
-            trusted_list: CFTypeRef,
-            access: *mut CFTypeRef,
-        ) -> OSStatus;
-        fn SecAccessCopyACLList(access: CFTypeRef, acl_list: *mut CFTypeRef) -> OSStatus;
-        fn SecACLSetContents(
-            acl: CFTypeRef,
-            application_list: CFTypeRef,
-            description: CFTypeRef,
-            prompt_selector: u16,
-        ) -> OSStatus;
-        fn SecKeychainItemCreateFromContent(
-            item_class: u32,
-            attr_list: *const AttributeList,
-            length: u32,
-            data: *const c_void,
-            keychain: CFTypeRef,
-            initial_access: CFTypeRef,
-            item: *mut CFTypeRef,
-        ) -> OSStatus;
-    }
-
-    /// Frees a CoreFoundation object when it goes out of scope.
-    struct Owned(CFTypeRef);
-    impl Drop for Owned {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { CFRelease(self.0) }
-            }
-        }
-    }
-
-    const UTF8: u32 = 0x0800_0100;
-    const GENERIC_PASSWORD: u32 = u32::from_be_bytes(*b"genp");
-    const SERVICE_ATTR: u32 = u32::from_be_bytes(*b"svce");
-    const ACCOUNT_ATTR: u32 = u32::from_be_bytes(*b"acct");
-    const DESCRIPTION_ATTR: u32 = u32::from_be_bytes(*b"desc");
-
-    let cfstring = |s: &str| -> Owned {
-        Owned(unsafe {
-            CFStringCreateWithBytes(
-                std::ptr::null(),
-                s.as_ptr(),
-                s.len() as isize,
-                UTF8,
-                0,
-            )
-        })
-    };
-
-    unsafe {
-        let mut keychain: CFTypeRef = std::ptr::null();
-        let status = SecKeychainCopyDefault(&mut keychain);
-        if status != 0 {
-            return Err(status);
-        }
-        let keychain = Owned(keychain);
-
-        // The access list names one program: `/usr/bin/security`, which is
-        // what `keychain_get` reads through. It is Apple-signed and its
-        // identity never changes, so the item stays readable across every
-        // rebuild and update of this agent - which is the whole point.
-        //
-        // A NULL application list is *not* "any application", whatever the
-        // old comment here claimed. Measured on macOS 15.7.7: an item written
-        // that way is refused outright, `security` exits 51 (authorisation
-        // denied) and no dialog is even offered. That left the agent unable to
-        // read back a password it had just stored.
-        let label = cfstring(SERVICE);
-        let mut reader: CFTypeRef = std::ptr::null();
-        let status =
-            SecTrustedApplicationCreateFromPath(c"/usr/bin/security".as_ptr() as *const u8, &mut reader);
-        if status != 0 {
-            return Err(status);
-        }
-        let reader = Owned(reader);
-        let trusted = Owned(CFArrayCreate(
-            std::ptr::null(),
-            &reader.0,
-            1,
-            &kCFTypeArrayCallBacks as *const c_void,
-        ));
-        if trusted.0.is_null() {
-            return Err(-1);
-        }
-        let mut access: CFTypeRef = std::ptr::null();
-        let status = SecAccessCreate(label.0, trusted.0, &mut access);
-        if status != 0 {
-            return Err(status);
-        }
-        let access = Owned(access);
-
-        // `SecAccessCreate` also adds this process to the list it builds, and
-        // this process's signature changes with every build. Rewrite each ACL
-        // so only the stable reader is named and nothing is ever prompted for.
-        let mut acls: CFTypeRef = std::ptr::null();
-        let status = SecAccessCopyACLList(access.0, &mut acls);
-        if status != 0 {
-            return Err(status);
-        }
-        let acls = Owned(acls);
-        let empty = cfstring("");
-        for i in 0..CFArrayGetCount(acls.0) {
-            let acl = CFArrayGetValueAtIndex(acls.0, i);
-            // A zero prompt selector means "never ask".
-            let status = SecACLSetContents(acl, trusted.0, empty.0, 0);
-            if status != 0 {
-                return Err(status);
-            }
-        }
-
-        let mut service = SERVICE.as_bytes().to_vec();
-        let mut account = remote_id.as_bytes().to_vec();
-        let mut description = b"MyDrives password".to_vec();
-        let mut attrs = [
-            Attribute {
-                tag: SERVICE_ATTR,
-                length: service.len() as u32,
-                data: service.as_mut_ptr() as *mut c_void,
-            },
-            Attribute {
-                tag: ACCOUNT_ATTR,
-                length: account.len() as u32,
-                data: account.as_mut_ptr() as *mut c_void,
-            },
-            Attribute {
-                tag: DESCRIPTION_ATTR,
-                length: description.len() as u32,
-                data: description.as_mut_ptr() as *mut c_void,
-            },
-        ];
-        let list = AttributeList {
-            count: attrs.len() as u32,
-            attr: attrs.as_mut_ptr(),
-        };
-        let mut item: CFTypeRef = std::ptr::null();
-        let status = SecKeychainItemCreateFromContent(
-            GENERIC_PASSWORD,
-            &list,
-            secret.len() as u32,
-            secret.as_ptr() as *const c_void,
-            keychain.0,
-            access.0,
-            &mut item,
-        );
-        if !item.is_null() {
-            CFRelease(item);
-        }
-        if status != 0 {
-            return Err(status);
-        }
-    }
-    Ok(())
+    Err(format!(
+        "{} ({})",
+        String::from_utf8_lossy(&out.stderr).trim(),
+        out.status
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -623,22 +457,16 @@ mod tests {
         assert!(missing.is_none());
     }
 
-    /// Writes a throwaway item into the real login keychain, reads it back
-    /// through the Security framework and removes it again.
+    /// Writes a throwaway item into the real login keychain, reads it back and
+    /// removes it again - the whole cycle the agent runs on every token
+    /// refresh, which is where the keychain dialogs came from.
     ///
-    /// The point is the *reading*: this test binary is signed differently from
-    /// whatever wrote the item, so if the item still carried a per-application
-    /// ACL the read would raise the "wants to use your confidential
-    /// information" dialog instead of returning the password - which is exactly
-    /// the behaviour that made the agent ask on every rebuild.
+    /// Each step goes through `/usr/bin/security`, so the item's partition
+    /// list names the one identity that reads it and nothing asks the user.
+    /// A step that starts prompting shows up here as a test that hangs, which
+    /// is the warning worth having.
     #[cfg(target_os = "macos")]
     #[test]
-    // Run with `cargo test -- --ignored`. Writing is prompt-free, which is
-    // the property that matters and is checked below; *deleting* an item is
-    // a separate authorisation, and a test binary carries a new ad-hoc
-    // signature on every build, so the tidy-up at the end stops for a
-    // password dialog and the run hangs on a developer machine.
-    #[ignore]
     fn keychain_round_trip_needs_no_authorisation() {
         let id = "mydrives-selftest-acl";
         let pw = "s3cret value;with#specials";
@@ -649,13 +477,12 @@ mod tests {
     }
 
     /// A sign-in leaves behind a JSON token set of several hundred bytes, not
-    /// a password someone typed. The writer this replaced handed the value to
+    /// a password someone typed. An older writer handed the value to
     /// `/usr/bin/security` on stdin, which stops reading at 128 characters: it
-    /// stored a truncated string, the drive fell back to a write that pins the
-    /// item to one binary, and every rebuild asked the user for permission.
+    /// stored a truncated string, and the fallback it triggered pinned the item
+    /// to one build, so every rebuild asked the user for permission.
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore] // same reason as above: the delete at the end wants a password
     fn a_token_set_is_stored_whole_however_long_it_is() {
         let id = "mydrives-selftest-long";
         let pw = format!(
