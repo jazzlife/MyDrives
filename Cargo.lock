@@ -3258,7 +3258,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "mydrives-backend-cloud"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "mydrives-core",
@@ -3275,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "mydrives-backend-ftp"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3294,7 +3294,7 @@ dependencies = [
 
 [[package]]
 name = "mydrives-backend-smb"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3307,7 +3307,7 @@ dependencies = [
 
 [[package]]
 name = "mydrives-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3319,7 +3319,7 @@ dependencies = [
 
 [[package]]
 name = "mydrives-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "directories",
@@ -3342,7 +3342,7 @@ dependencies = [
 
 [[package]]
 name = "mydrives-daemon"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3367,7 +3367,7 @@ dependencies = [
 
 [[package]]
 name = "mydrives-ipc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "mydrives-core",
  "serde",
@@ -3379,7 +3379,7 @@ dependencies = [
 
 [[package]]
 name = "mydrives-mount-fuse"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fuser",
  "libc",
@@ -3391,7 +3391,7 @@ dependencies = [
 
 [[package]]
 name = "mydrives-mount-nfs"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "libc",
@@ -3404,7 +3404,7 @@ dependencies = [
 
 [[package]]
 name = "mydrives-mount-windows"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "libloading 0.8.9",
  "mydrives-core",
@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "mydrives-ui"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "eframe",
  "egui",
