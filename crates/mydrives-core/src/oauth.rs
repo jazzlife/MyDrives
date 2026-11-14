@@ -513,30 +513,66 @@ async fn wait_for_redirect(
 }
 
 /// Opens `url` in the user's browser.
+///
+/// A sign-in URL has to arrive whole, and on Windows that rules out the
+/// obvious `cmd /C start ""  <url>`: `cmd` ends a command at `&`, Rust quotes
+/// only arguments that contain a space, and the browser is left opening
+/// everything up to the first parameter separator - at which point the
+/// service answers "the request body must contain the following parameter:
+/// 'scope'". `rundll32`'s protocol handler never sees a shell, so it is the
+/// way in; `cmd` stays as a fallback with the URL quoted, which keeps `&`
+/// part of it. (`explorer <url>`, the other usual answer, silently opens
+/// nothing when the caller is elevated, so it is not used here.)
 pub fn open_in_browser(url: &str) -> Result<()> {
+    let mut attempts: Vec<std::process::Command> = Vec::new();
+
     #[cfg(target_os = "macos")]
-    let mut cmd = {
+    attempts.push({
         let mut c = std::process::Command::new("/usr/bin/open");
         c.arg(url);
         c
-    };
+    });
+
     #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", "", url]);
-        c
-    };
+    {
+        attempts.push({
+            let mut c = std::process::Command::new("rundll32.exe");
+            c.args(["url.dll,FileProtocolHandler", url]);
+            c
+        });
+        attempts.push({
+            use std::os::windows::process::CommandExt;
+            let mut c = std::process::Command::new("cmd");
+            // Quoted by hand: Rust's own quoting follows the C runtime's
+            // rules, which are not `cmd`'s. A `"` in the URL would end the
+            // quoting early, so it goes in encoded.
+            c.raw_arg(format!("/C start \"\" \"{}\"", url.replace('"', "%22")));
+            c
+        });
+    }
+
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let mut cmd = {
+    attempts.push({
         let mut c = std::process::Command::new("xdg-open");
         c.arg(url);
         c
-    };
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| Error::Backend(format!("브라우저를 열 수 없습니다: {e}")))
+    });
+
+    let mut last = None;
+    for mut cmd in attempts {
+        match cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(Error::Backend(format!(
+        "브라우저를 열 수 없습니다: {}",
+        last.map(|e| e.to_string()).unwrap_or_default()
+    )))
 }
 
 /// A signed-in service: hands out a usable access token, refreshing it when
