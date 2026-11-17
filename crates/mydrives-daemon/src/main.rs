@@ -162,6 +162,7 @@ fn main() -> anyhow::Result<()> {
                 id,
                 label: "dev mount".into(),
                 automount: true,
+                detached: false,
                 readonly,
                 provider,
                 drive,
@@ -400,6 +401,29 @@ async fn wait_for_shutdown(ipc: Option<Arc<tokio::sync::Notify>>) {
     tracing::info!("shutting down; unmounting everything");
 }
 
+/// A connect or disconnect the user asked for is remembered, so the next start
+/// restores what they had - not what the drive's automount flag alone says.
+/// Reconnects by the watchdog and the shutdown unmount go straight to the
+/// manager and leave this alone.
+pub(crate) fn remember_detached(
+    config: &Arc<Mutex<AppConfig>>,
+    manager: &Arc<MountManager>,
+    id: &str,
+    detached: bool,
+) {
+    let updated = {
+        let mut cfg = config.lock();
+        cfg.set_detached(id, detached)
+            .map(|remote| (remote, cfg.save()))
+    };
+    if let Some((remote, saved)) = updated {
+        manager.put(remote);
+        if let Err(e) = saved {
+            tracing::warn!(remote = %id, error = %e, "saving the connection state failed");
+        }
+    }
+}
+
 /// Puts a password the user just typed into a throwaway config.
 ///
 /// "Test" and "list shares" run against settings that have not been saved yet,
@@ -542,6 +566,12 @@ async fn handle(
                 );
             }
             let id = remote.id.clone();
+            // The form does not know whether the drive was taken down by hand;
+            // that survives an edit - unless the edit is about automount itself,
+            // in which case the user's new answer wins.
+            if let Some(previous) = manager.config_of(&id) {
+                remote.detached = previous.detached && previous.automount == remote.automount;
+            }
             // A drive moved to another folder gets a new sidebar row when it
             // mounts; the old one would otherwise stay, pointing nowhere.
             if let Some(previous) = manager.config_of(&id) {
@@ -745,7 +775,10 @@ async fn handle(
                 ensure_mount_layer(&config, Some(remote)).await;
             }
             match manager.mount(&id).await {
-                Ok(mountpoint) => (Response::Mounted { id, mountpoint }, false),
+                Ok(mountpoint) => {
+                    remember_detached(&config, &manager, &id, false);
+                    (Response::Mounted { id, mountpoint }, false)
+                }
                 Err(e) => (
                     Response::Error {
                         message: e.to_string(),
@@ -755,7 +788,10 @@ async fn handle(
             }
         }
         Request::Unmount { id } => match manager.unmount(&id).await {
-            Ok(()) => (Response::Ok, false),
+            Ok(()) => {
+                remember_detached(&config, &manager, &id, true);
+                (Response::Ok, false)
+            }
             Err(e) => (
                 Response::Error {
                     message: e.to_string(),

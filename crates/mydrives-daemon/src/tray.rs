@@ -321,17 +321,25 @@ impl Tray {
         match action {
             Action::Mount(id) => {
                 let manager = self.manager.clone();
+                let config = self.config.clone();
                 self.rt.spawn(async move {
-                    if let Err(e) = manager.mount(&id).await {
-                        tracing::error!(remote = %id, error = %e, "mount from the tray failed");
+                    match manager.mount(&id).await {
+                        Ok(_) => crate::remember_detached(&config, &manager, &id, false),
+                        Err(e) => {
+                            tracing::error!(remote = %id, error = %e, "mount from the tray failed")
+                        }
                     }
                 });
             }
             Action::Unmount(id) => {
                 let manager = self.manager.clone();
+                let config = self.config.clone();
                 self.rt.spawn(async move {
-                    if let Err(e) = manager.unmount(&id).await {
-                        tracing::error!(remote = %id, error = %e, "unmount from the tray failed");
+                    match manager.unmount(&id).await {
+                        Ok(()) => crate::remember_detached(&config, &manager, &id, true),
+                        Err(e) => {
+                            tracing::error!(remote = %id, error = %e, "unmount from the tray failed")
+                        }
                     }
                 });
             }

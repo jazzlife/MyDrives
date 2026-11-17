@@ -452,6 +452,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 id: "probe".into(),
                 label: String::new(),
                 automount: false,
+                detached: false,
                 readonly: true,
                 provider: None,
                 drive: None,
@@ -647,6 +648,7 @@ async fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<Str
                     // 비우면 에이전트가 제품 이름(NAS 이름·서비스 이름)으로 채웁니다.
                     label: label.unwrap_or_default(),
                     automount: !no_automount,
+                    detached: false,
                     readonly,
                     provider,
                     drive,
@@ -715,6 +717,7 @@ async fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<Str
                     // 비우면 에이전트가 제품 이름(호스트 이름)으로 채웁니다.
                     label: label.unwrap_or_default(),
                     automount: !no_automount,
+                    detached: false,
                     readonly,
                     provider,
                     drive,
@@ -769,6 +772,7 @@ async fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<Str
                 RemoteConfig {
                     label: label.unwrap_or_default(),
                     automount: !no_automount,
+                    detached: false,
                     readonly,
                     provider,
                     drive,
@@ -816,6 +820,7 @@ async fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<Str
                 RemoteConfig {
                     label: label.unwrap_or_default(),
                     automount: !no_automount,
+                    detached: false,
                     readonly,
                     provider,
                     drive,
@@ -854,6 +859,7 @@ async fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<Str
                 RemoteConfig {
                     label: label.unwrap_or_default(),
                     automount: !no_automount,
+                    detached: false,
                     readonly,
                     provider,
                     drive,
@@ -892,6 +898,7 @@ async fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<Str
                 RemoteConfig {
                     label: label.unwrap_or_default(),
                     automount: !no_automount,
+                    detached: false,
                     readonly,
                     provider,
                     drive,
@@ -918,6 +925,7 @@ async fn build_remote(kind: AddKind) -> anyhow::Result<(RemoteConfig, Option<Str
                 // 에이전트가 제품 이름으로 채웁니다.
                 label: String::new(),
                 automount: false,
+                detached: false,
                 readonly: false,
                 provider: None,
                 drive,

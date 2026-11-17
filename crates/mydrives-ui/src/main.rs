@@ -627,6 +627,7 @@ impl Form {
             // 비워 두면 에이전트가 제품 이름으로 채웁니다.
             label: self.name.trim().to_string(),
             automount: self.automount,
+            detached: false,
             readonly: self.readonly,
             provider: None,
             drive: opt(&self.drive),

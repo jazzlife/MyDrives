@@ -121,6 +121,14 @@ pub struct RemoteConfig {
     pub label: String,
     #[serde(default = "default_true")]
     pub automount: bool,
+    /// The user disconnected this drive by hand and has not connected it since.
+    ///
+    /// `automount` is the user's standing wish; this is the exception to it. A
+    /// drive they took down stays down across restarts until they bring it back
+    /// themselves - otherwise "연결 해제" would quietly undo itself on the next
+    /// launch, which is what made it look like the setting did nothing.
+    #[serde(default)]
+    pub detached: bool,
     #[serde(default)]
     pub readonly: bool,
     /// Mount layer to use: `fuse`, `nfs`, `winfsp`, or unset for "best available".
@@ -391,6 +399,17 @@ impl AppConfig {
         self.remotes.iter().find(|r| r.id == id)
     }
 
+    /// Records whether the user disconnected `id` by hand. Returns the updated
+    /// entry when the flag actually changed, `None` when there was nothing to do.
+    pub fn set_detached(&mut self, id: &str, detached: bool) -> Option<RemoteConfig> {
+        let slot = self.remotes.iter_mut().find(|r| r.id == id)?;
+        if slot.detached == detached {
+            return None;
+        }
+        slot.detached = detached;
+        Some(slot.clone())
+    }
+
     pub fn upsert(&mut self, remote: RemoteConfig) {
         match self.remotes.iter_mut().find(|r| r.id == remote.id) {
             Some(slot) => *slot = remote,
@@ -428,6 +447,7 @@ mod tests {
             id: "nas".into(),
             label: "home NAS".into(),
             automount: true,
+            detached: false,
             readonly: false,
             provider: None,
             drive: Some("Z:".into()),
@@ -454,6 +474,38 @@ mod tests {
             }
             _ => panic!("wrong kind"),
         }
+    }
+
+    #[test]
+    fn a_drive_taken_down_by_hand_is_remembered_and_old_configs_still_load() {
+        let mut cfg = AppConfig::default();
+        cfg.upsert(RemoteConfig {
+            id: "nas".into(),
+            label: String::new(),
+            automount: true,
+            detached: false,
+            readonly: false,
+            provider: None,
+            drive: None,
+            mountpoint: None,
+            backend: BackendConfig::Mem(MemConfig { fixture: true }),
+        });
+        assert!(cfg.set_detached("nas", true).is_some());
+        assert!(cfg.set_detached("nas", true).is_none(), "no change, nothing to save");
+        assert!(cfg.set_detached("other", true).is_none());
+        let back: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert!(back.remotes[0].detached);
+
+        // A config written before the flag existed means "never taken down".
+        let old = r#"
+[[remote]]
+id = "nas"
+[remote.backend]
+kind = "mem"
+fixture = true
+"#;
+        let back: AppConfig = toml::from_str(old).unwrap();
+        assert!(back.remotes[0].automount && !back.remotes[0].detached);
     }
 
     #[test]

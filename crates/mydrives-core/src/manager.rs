@@ -429,7 +429,14 @@ impl MountManager {
             self.order
                 .lock()
                 .iter()
-                .filter(|id| remotes.get(*id).map(|r| r.cfg.automount) == Some(true))
+                // A drive the user disconnected by hand stays that way; see
+                // `RemoteConfig::detached`.
+                .filter(|id| {
+                    remotes
+                        .get(*id)
+                        .map(|r| r.cfg.automount && !r.cfg.detached)
+                        == Some(true)
+                })
                 .cloned()
                 .collect()
         };
@@ -719,6 +726,7 @@ mod tests {
             id: "nas".into(),
             label: String::new(),
             automount: false,
+            detached: false,
             readonly: false,
             provider: None,
             drive: None,
